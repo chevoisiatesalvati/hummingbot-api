@@ -162,8 +162,13 @@ cython_debug/
 # Hummingbot Gateway files
 gateway-files/
 
-# Instance files
-bots/instances/*
+# Hummingbot credentials and local data
+bots/credentials/
+bots/instances/
 
-# Credentials files
-bots/credentials/*
+# Local MCP configuration (project-specific overrides)
+.mcp.json
+
+# IDE files
+.vscode/
+.idea/

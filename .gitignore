@@ -161,3 +161,9 @@ cython_debug/
 
 # Hummingbot Gateway files
 gateway-files/
+
+# Instance files
+bots/instances/*
+
+# Credentials files
+bots/credentials/*

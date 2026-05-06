@@ -172,6 +172,7 @@ gateway-files/
 bots/credentials/
 bots/instances/
 bots/conf/
+bots/archived/
 
 # Local MCP configuration (project-specific overrides)
 .mcp.json

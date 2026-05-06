@@ -1,11 +1,18 @@
 from fastapi import Request
-from services.bots_orchestrator import BotsOrchestrator
-from services.accounts_service import AccountsService
-from services.docker_service import DockerService
-from services.gateway_service import GatewayService
-from services.market_data_feed_manager import MarketDataFeedManager
-from utils.bot_archiver import BotArchiver
+
 from database import AsyncDatabaseManager
+from services.accounts_service import AccountsService
+from services.bots_orchestrator import BotsOrchestrator
+from services.docker_service import DockerService
+from services.executor_service import ExecutorService
+from services.executor_ws_manager import ExecutorWebSocketManager
+from services.gateway_service import GatewayService
+from services.market_data_service import MarketDataService
+from services.trading_service import TradingService
+from services.unified_connector_service import UnifiedConnectorService
+from services.backtesting_service import BacktestingService
+from services.websocket_manager import WebSocketManager
+from utils.bot_archiver import BotArchiver
 
 
 def get_bots_orchestrator(request: Request) -> BotsOrchestrator:
@@ -28,9 +35,24 @@ def get_gateway_service(request: Request) -> GatewayService:
     return request.app.state.gateway_service
 
 
-def get_market_data_feed_manager(request: Request) -> MarketDataFeedManager:
-    """Get MarketDataFeedManager from app state."""
-    return request.app.state.market_data_feed_manager
+def get_connector_service(request: Request) -> UnifiedConnectorService:
+    """Get UnifiedConnectorService from app state."""
+    return request.app.state.connector_service
+
+
+def get_market_data_service(request: Request) -> MarketDataService:
+    """Get MarketDataService from app state."""
+    return request.app.state.market_data_service
+
+
+def get_trading_service(request: Request) -> TradingService:
+    """Get TradingService from app state."""
+    return request.app.state.trading_service
+
+
+def get_executor_service(request: Request) -> ExecutorService:
+    """Get ExecutorService from app state."""
+    return request.app.state.executor_service
 
 
 def get_bot_archiver(request: Request) -> BotArchiver:
@@ -40,4 +62,19 @@ def get_bot_archiver(request: Request) -> BotArchiver:
 
 def get_database_manager(request: Request) -> AsyncDatabaseManager:
     """Get AsyncDatabaseManager from app state."""
-    return request.app.state.accounts_service.db_manager
+    return request.app.state.db_manager
+
+
+def get_executor_ws_manager(request: Request) -> ExecutorWebSocketManager:
+    """Get ExecutorWebSocketManager from app state."""
+    return request.app.state.executor_ws_manager
+
+
+def get_backtesting_service(request: Request) -> BacktestingService:
+    """Get BacktestingService from app state."""
+    return request.app.state.backtesting_service
+
+
+def get_websocket_manager(request: Request) -> WebSocketManager:
+    """Get WebSocketManager from app state."""
+    return request.app.state.websocket_manager

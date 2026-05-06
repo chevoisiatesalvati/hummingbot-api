@@ -1,19 +1,20 @@
-from database import AsyncDatabaseManager, BotRunRepository
-from utils.bot_archiver import BotArchiver
-from utils.file_system import fs_util
-from deps import get_bots_orchestrator, get_docker_service, get_bot_archiver, get_database_manager
-from services.docker_service import DockerService
-from services.bots_orchestrator import BotsOrchestrator
-from models import StartBotAction, StopBotAction, V2ScriptDeployment, V2ControllerDeployment
+import asyncio
 import logging
 import os
-import asyncio
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+
+from database import AsyncDatabaseManager, BotRunRepository
+from deps import get_bot_archiver, get_bots_orchestrator, get_database_manager, get_docker_service
+from models import StartBotAction, StopBotAction, V2ControllerDeployment, V2ScriptDeployment
+from services.bots_orchestrator import BotsOrchestrator
+from services.docker_service import DockerService
+from utils.bot_archiver import BotArchiver
+from utils.file_system import fs_util
 
 # Create module-specific logger
 logger = logging.getLogger(__name__)
-
 
 router = APIRouter(tags=["Bot Orchestration"], prefix="/bot-orchestration")
 
@@ -138,8 +139,10 @@ async def start_bot(
     Returns:
         Dictionary with status and response from bot start operation
     """
-    response = await bots_manager.start_bot(action.bot_name, log_level=action.log_level, script=action.script,
-                                            conf=action.conf, async_backend=action.async_backend)
+    response = await bots_manager.start_bot(
+        action.bot_name, log_level=action.log_level, script=action.script,
+        conf=action.conf, async_backend=action.async_backend
+    )
 
     # Bot run tracking simplified - only track deployment and stop times
 
@@ -163,15 +166,24 @@ async def stop_bot(
     Returns:
         Dictionary with status and response from bot stop operation
     """
-    response = await bots_manager.stop_bot(action.bot_name, skip_order_cancellation=action.skip_order_cancellation,
-                                           async_backend=action.async_backend)
+    # Capture final status BEFORE stopping (performance data is cleared on stop)
+    final_status = None
+    try:
+        final_status = bots_manager.get_bot_status(action.bot_name)
+        logger.info(
+            f"Captured final status for {action.bot_name} before stopping")
+    except Exception as e:
+        logger.warning(
+            f"Failed to capture final status for {action.bot_name}: {e}")
+
+    response = await bots_manager.stop_bot(
+        action.bot_name, skip_order_cancellation=action.skip_order_cancellation,
+        async_backend=action.async_backend
+    )
 
     # Update bot run status to STOPPED if stop was successful
     if response.get("success"):
         try:
-            # Try to get bot status for final status data
-            final_status = bots_manager.get_bot_status(action.bot_name)
-
             async with db_manager.get_session_context() as session:
                 bot_run_repo = BotRunRepository(session)
                 await bot_run_repo.update_bot_run_stopped(
@@ -556,7 +568,10 @@ async def stop_and_archive_bot(
         if not bot_found:
             return {
                 "status": "error",
-                "message": f"Bot '{actual_bot_name}' not found in active bots. Active bots: {active_bots}. Cannot perform graceful shutdown.",
+                "message": (
+                    f"Bot '{actual_bot_name}' not found in active bots. "
+                    f"Active bots: {active_bots}. Cannot perform graceful shutdown."
+                ),
                 "details": {
                     "input_name": bot_name,
                     "actual_bot_name": actual_bot_name,
@@ -591,7 +606,10 @@ async def stop_and_archive_bot(
                 "input_name": bot_name,
                 "actual_bot_name": actual_bot_name,
                 "container_name": container_name,
-                "process": "The bot will be gracefully stopped, archived, and removed in the background. This process typically takes 20-30 seconds."
+                "process": (
+                    "The bot will be gracefully stopped, archived, and removed in the background. "
+                    "This process typically takes 20-30 seconds."
+                )
             }
         }
 
@@ -599,50 +617,6 @@ async def stop_and_archive_bot(
         logging.error(
             f"Error initiating stop_and_archive_bot for {bot_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/deploy-v2-script")
-async def deploy_v2_script(
-    config: V2ScriptDeployment,
-    docker_manager: DockerService = Depends(get_docker_service),
-    db_manager: AsyncDatabaseManager = Depends(get_database_manager)
-):
-    """
-    Creates and autostart a v2 script with a configuration if present.
-
-    Args:
-        config: Configuration for the new Hummingbot instance
-        docker_manager: Docker service dependency
-        db_manager: Database manager dependency
-
-    Returns:
-        Dictionary with creation response and instance details
-    """
-    logging.info(f"Creating hummingbot instance with config: {config}")
-    response = docker_manager.create_hummingbot_instance(config)
-
-    # Track bot run if deployment was successful
-    if response.get("success"):
-        try:
-            async with db_manager.get_session_context() as session:
-                bot_run_repo = BotRunRepository(session)
-                await bot_run_repo.create_bot_run(
-                    bot_name=config.instance_name,
-                    instance_name=config.instance_name,
-                    strategy_type="script",
-                    strategy_name=config.script or "unknown",
-                    account_name=config.credentials_profile,
-                    config_name=config.script_config,
-                    image_version=config.image,
-                    deployment_config=config.dict()
-                )
-                logger.info(
-                    f"Created bot run record for {config.instance_name}")
-        except Exception as e:
-            logger.error(f"Failed to create bot run record: {e}")
-            # Don't fail the deployment if bot run creation fails
-
-    return response
 
 
 @router.post("/deploy-v2-controllers")
@@ -681,10 +655,10 @@ async def deploy_v2_controllers(
                 controllers_with_extension.append(controller)
 
         # Create the script config content
+        # Note: candles_config and markets removed - they're optional and empty,
+        # and older hummingbot versions don't expect them in the config
         script_config_content = {
             "script_file_name": "v2_with_controllers.py",
-            "candles_config": [],
-            "markets": {},
             "controllers_config": controllers_with_extension,
         }
 
@@ -703,17 +677,10 @@ async def deploy_v2_controllers(
         logging.info(
             f"Generated script config: {script_config_filename} with content: {script_config_content}")
 
-        # Create the V2ScriptDeployment with the generated script config
-        instance_config = V2ScriptDeployment(
-            instance_name=unique_instance_name,
-            credentials_profile=deployment.credentials_profile,
-            image=deployment.image,
-            script="v2_with_controllers.py",
-            script_config=script_config_filename
-        )
-
-        # Deploy the instance using the existing method
-        response = docker_manager.create_hummingbot_instance(instance_config)
+        # Set generated config on the deployment and deploy
+        deployment.instance_name = unique_instance_name
+        deployment.script_config = script_config_filename
+        response = docker_manager.create_hummingbot_instance(deployment)
 
         if response.get("success"):
             response["script_config_generated"] = script_config_filename
@@ -772,4 +739,67 @@ async def deploy_v2_controllers(
 
     except Exception as e:
         logging.error(f"Error deploying V2 controllers: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/deploy-v2-script")
+async def deploy_v2_script(
+    deployment: V2ScriptDeployment,
+    docker_manager: DockerService = Depends(get_docker_service),
+    db_manager: AsyncDatabaseManager = Depends(get_database_manager)
+):
+    """
+    Deploy a V2 script bot with optional script configuration.
+    This endpoint creates and starts a Hummingbot instance running the specified script.
+
+    Args:
+        deployment: V2ScriptDeployment configuration containing instance name, credentials,
+                   optional script name and configuration
+        docker_manager: Docker service dependency
+        db_manager: Database manager dependency
+
+    Returns:
+        Dictionary with deployment response including instance details
+
+    Raises:
+        HTTPException: 500 if deployment fails
+    """
+    try:
+        # Generate unique instance name with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        unique_instance_name = f"{deployment.instance_name}-{timestamp}"
+
+        # Update deployment with unique name
+        deployment.instance_name = unique_instance_name
+
+        # Create the hummingbot instance
+        response = docker_manager.create_hummingbot_instance(deployment)
+
+        if response.get("success"):
+            response["unique_instance_name"] = unique_instance_name
+
+            # Track bot run if deployment was successful
+            try:
+                async with db_manager.get_session_context() as session:
+                    bot_run_repo = BotRunRepository(session)
+                    await bot_run_repo.create_bot_run(
+                        bot_name=unique_instance_name,
+                        instance_name=unique_instance_name,
+                        strategy_type="script",
+                        strategy_name=deployment.script or "default",
+                        account_name=deployment.credentials_profile,
+                        config_name=deployment.script_config,
+                        image_version=deployment.image,
+                        deployment_config=deployment.dict()
+                    )
+                    logger.info(
+                        f"Created bot run record for script deployment {unique_instance_name}")
+            except Exception as e:
+                logger.error(f"Failed to create bot run record: {e}")
+                # Don't fail the deployment if bot run creation fails
+
+        return response
+
+    except Exception as e:
+        logging.error(f"Error deploying V2 script: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

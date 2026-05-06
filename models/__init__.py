@@ -5,187 +5,197 @@ Each model file corresponds to a router file with the same name.
 Models are organized by functional domain to match the API structure.
 """
 
-# Bot orchestration models (bot lifecycle management)
-from .bot_orchestration import (
-    BotAction,
-    StartBotAction,
-    StopBotAction,
-    ImportStrategyAction,
-    ConfigureBotAction,
-    ShortcutAction,
-    BotStatus,
-    BotHistoryRequest,
-    BotHistoryResponse,
-    MQTTStatus,
-    AllBotsStatusResponse,
-    StopAndArchiveRequest,
-    StopAndArchiveResponse,
-    V2ScriptDeployment,
-    V2ControllerDeployment,
-)
-
-# Trading models
-from .trading import (
-    TradeRequest,
-    TradeResponse,
-    TokenInfo,
-    ConnectorBalance,
-    AccountBalance,
-    PortfolioState,
-    OrderInfo,
-    ActiveOrdersResponse,
-    OrderSummary,
-    TradeInfo,
-    TradingRulesInfo,
-    OrderTypesResponse,
-    OrderFilterRequest,
-    ActiveOrderFilterRequest,
-    PositionFilterRequest,
-    FundingPaymentFilterRequest,
-    TradeFilterRequest,
-)
-
-# Controller models
-from .controllers import (
-    ControllerType,
-    Controller,
-    ControllerResponse,
-    ControllerConfig,
-    ControllerConfigResponse,
-)
-
-# Script models
-from .scripts import (
-    Script,
-    ScriptResponse,
-    ScriptConfig,
-    ScriptConfigResponse,
-)
-
-
-# Market data models
-from .market_data import (
-    CandleData,
-    CandlesResponse,
-    ActiveFeedInfo,
-    ActiveFeedsResponse,
-    MarketDataSettings,
-    TradingRulesResponse,
-    SupportedOrderTypesResponse,
-    # New enhanced market data models
-    PriceRequest,
-    PriceData,
-    PricesResponse,
-    FundingInfoRequest,
-    FundingInfoResponse,
-    OrderBookRequest,
-    OrderBookLevel,
-    OrderBookResponse,
-    OrderBookQueryRequest,
-    VolumeForPriceRequest,
-    PriceForVolumeRequest,
-    QuoteVolumeForPriceRequest,
-    PriceForQuoteVolumeRequest,
-    VWAPForVolumeRequest,
-    OrderBookQueryResult,
-)
-
 # Account models
-from .accounts import (
-    LeverageRequest,
-    PositionModeRequest,
-    CredentialRequest,
-)
+from .accounts import CredentialRequest, LeverageRequest, PositionModeRequest
 
-
-# Docker models
-from .docker import DockerImage
-
-# Gateway models (consolidated)
-from .gateway import (
-    GatewayConfig,
-    GatewayStatus,
-    GatewayWalletCredential,
-    GatewayWalletInfo,
-    GatewayBalanceRequest,
-    AddPoolRequest,
-    AddTokenRequest,
+# Archived bots models
+from .archived_bots import (
+    ArchivedBotListResponse,
+    BotPerformanceResponse,
+    BotSummary,
+    DatabaseStatus,
+    ExecutorInfo,
+    ExecutorsResponse,
+    OrderDetail,
+    OrderHistoryResponse,
+    OrderStatus,
+    PerformanceMetrics,
+    TradeDetail,
+    TradeHistoryResponse,
 )
 
 # Backtesting models
 from .backtesting import BacktestingConfig
 
-# Pagination models
-from .pagination import PaginatedResponse, PaginationParams, TimeRangePaginationParams
+# Bot orchestration models (bot lifecycle management)
+from .bot_orchestration import (
+    AllBotsStatusResponse,
+    BotAction,
+    BotHistoryRequest,
+    BotHistoryResponse,
+    BotStatus,
+    ConfigureBotAction,
+    ImportStrategyAction,
+    MQTTStatus,
+    ShortcutAction,
+    StartBotAction,
+    StopAndArchiveRequest,
+    StopAndArchiveResponse,
+    StopBotAction,
+    V2ControllerDeployment,
+    V2ScriptDeployment,
+)
 
 # Connector models
 from .connectors import (
-    ConnectorInfo,
     ConnectorConfigMapResponse,
-    TradingRule,
-    ConnectorTradingRulesResponse,
-    ConnectorOrderTypesResponse,
+    ConnectorInfo,
     ConnectorListResponse,
+    ConnectorOrderTypesResponse,
+    ConnectorTradingRulesResponse,
+    TradingRule,
+)
+
+# Controller models
+from .controllers import Controller, ControllerConfig, ControllerConfigResponse, ControllerResponse, ControllerType
+
+# Docker models
+from .docker import DockerImage
+
+# Executor models
+from .executors import (
+    CreateExecutorRequest,
+    CreateExecutorResponse,
+    ExecutorDetailResponse,
+    ExecutorFilterRequest,
+    ExecutorResponse,
+    ExecutorsSummaryResponse,
+    StopExecutorRequest,
+    StopExecutorResponse,
+)
+
+# Gateway models (consolidated)
+from .gateway import (
+    AddPoolRequest,
+    AddTokenRequest,
+    CreateWalletRequest,
+    GatewayBalanceRequest,
+    GatewayConfig,
+    GatewayStatus,
+    GatewayWalletCredential,
+    GatewayWalletInfo,
+    SendTransactionRequest,
+    SetDefaultWalletRequest,
+    ShowPrivateKeyRequest,
 )
 
 # Gateway Trading models (Swap + CLMM only, AMM removed)
-from .gateway_trading import (
-    # Swap models
-    SwapQuoteRequest,
-    SwapQuoteResponse,
-    SwapExecuteRequest,
-    SwapExecuteResponse,
-    # CLMM models
-    CLMMOpenPositionRequest,
-    CLMMOpenPositionResponse,
+from .gateway_trading import (  # Swap models; CLMM models; Pool info models; Pool listing models
     CLMMAddLiquidityRequest,
-    CLMMRemoveLiquidityRequest,
     CLMMClosePositionRequest,
     CLMMCollectFeesRequest,
     CLMMCollectFeesResponse,
-    CLMMPositionsOwnedRequest,
-    CLMMPositionInfo,
     CLMMGetPositionInfoRequest,
-    CLMMPoolInfoRequest,
+    CLMMOpenPositionRequest,
+    CLMMOpenPositionResponse,
     CLMMPoolBin,
+    CLMMPoolInfoRequest,
     CLMMPoolInfoResponse,
-    # Pool info models
-    GetPoolInfoRequest,
-    PoolInfo,
-    # Pool listing models
-    TimeBasedMetrics,
     CLMMPoolListItem,
     CLMMPoolListResponse,
+    CLMMPositionInfo,
+    CLMMPositionsOwnedRequest,
+    CLMMRemoveLiquidityRequest,
+    GetPoolInfoRequest,
+    PoolInfo,
+    SwapExecuteRequest,
+    SwapExecuteResponse,
+    SwapQuoteRequest,
+    SwapQuoteResponse,
+    TimeBasedMetrics,
 )
+
+# Market data models
+from .market_data import (  # New enhanced market data models; Trading pair management models
+    ActiveFeedInfo,
+    ActiveFeedsResponse,
+    AddTradingPairRequest,
+    CandleData,
+    CandlesResponse,
+    FundingInfoRequest,
+    FundingInfoResponse,
+    MarketDataSettings,
+    OrderBookLevel,
+    OrderBookQueryRequest,
+    OrderBookQueryResult,
+    OrderBookRequest,
+    OrderBookResponse,
+    PriceData,
+    PriceForQuoteVolumeRequest,
+    PriceForVolumeRequest,
+    PriceRequest,
+    PricesResponse,
+    QuoteVolumeForPriceRequest,
+    RemoveTradingPairRequest,
+    SupportedOrderTypesResponse,
+    TradingPairResponse,
+    TradingRulesResponse,
+    VolumeForPriceRequest,
+    VWAPForVolumeRequest,
+)
+
+# Pagination models
+from .pagination import PaginatedResponse, PaginationParams, TimeRangePaginationParams
 
 # Portfolio models
 from .portfolio import (
-    TokenBalance,
-    ConnectorBalances,
-    AccountPortfolioState,
-    PortfolioStateResponse,
-    TokenDistribution,
-    PortfolioDistributionResponse,
     AccountDistribution,
+    AccountPortfolioState,
     AccountsDistributionResponse,
+    ConnectorBalances,
     HistoricalPortfolioState,
+    PortfolioDistributionResponse,
     PortfolioHistoryFilters,
+    PortfolioStateResponse,
+    TokenBalance,
+    TokenDistribution,
 )
 
-# Archived bots models
-from .archived_bots import (
-    OrderStatus,
-    DatabaseStatus,
-    BotSummary,
-    PerformanceMetrics,
-    TradeDetail,
-    OrderDetail,
-    ExecutorInfo,
-    ArchivedBotListResponse,
-    BotPerformanceResponse,
-    TradeHistoryResponse,
-    OrderHistoryResponse,
-    ExecutorsResponse,
+# Rate Oracle models
+from .rate_oracle import (
+    GlobalTokenConfig,
+    RateOracleConfig,
+    RateOracleConfigResponse,
+    RateOracleConfigUpdateRequest,
+    RateOracleConfigUpdateResponse,
+    RateOracleSourceConfig,
+    RateRequest,
+    RateResponse,
+    SingleRateResponse,
+)
+
+# Script models
+from .scripts import Script, ScriptConfig, ScriptConfigResponse, ScriptResponse
+
+# Trading models
+from .trading import (
+    AccountBalance,
+    ActiveOrderFilterRequest,
+    ActiveOrdersResponse,
+    ConnectorBalance,
+    FundingPaymentFilterRequest,
+    OrderFilterRequest,
+    OrderInfo,
+    OrderSummary,
+    OrderTypesResponse,
+    PortfolioState,
+    PositionFilterRequest,
+    TokenInfo,
+    TradeFilterRequest,
+    TradeInfo,
+    TradeRequest,
+    TradeResponse,
+    TradingRulesInfo,
 )
 
 __all__ = [
@@ -203,8 +213,8 @@ __all__ = [
     "AllBotsStatusResponse",
     "StopAndArchiveRequest",
     "StopAndArchiveResponse",
-    "V2ScriptDeployment",
     "V2ControllerDeployment",
+    "V2ScriptDeployment",
     # Trading models
     "TradeRequest",
     "TradeResponse",
@@ -258,6 +268,10 @@ __all__ = [
     "PriceForQuoteVolumeRequest",
     "VWAPForVolumeRequest",
     "OrderBookQueryResult",
+    # Trading pair management models
+    "AddTradingPairRequest",
+    "RemoveTradingPairRequest",
+    "TradingPairResponse",
     # Account models
     "LeverageRequest",
     "PositionModeRequest",
@@ -267,6 +281,10 @@ __all__ = [
     # Gateway models
     "GatewayConfig",
     "GatewayStatus",
+    "CreateWalletRequest",
+    "ShowPrivateKeyRequest",
+    "SendTransactionRequest",
+    "SetDefaultWalletRequest",
     "GatewayWalletCredential",
     "GatewayWalletInfo",
     "GatewayBalanceRequest",
@@ -332,4 +350,23 @@ __all__ = [
     "TradeHistoryResponse",
     "OrderHistoryResponse",
     "ExecutorsResponse",
+    # Rate Oracle models
+    "GlobalTokenConfig",
+    "RateOracleSourceConfig",
+    "RateOracleConfig",
+    "RateOracleConfigResponse",
+    "RateOracleConfigUpdateRequest",
+    "RateOracleConfigUpdateResponse",
+    "RateRequest",
+    "RateResponse",
+    "SingleRateResponse",
+    # Executor models
+    "CreateExecutorRequest",
+    "CreateExecutorResponse",
+    "StopExecutorRequest",
+    "StopExecutorResponse",
+    "ExecutorFilterRequest",
+    "ExecutorResponse",
+    "ExecutorDetailResponse",
+    "ExecutorsSummaryResponse",
 ]

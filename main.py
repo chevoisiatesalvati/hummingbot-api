@@ -1,10 +1,14 @@
+import logging
 import secrets
 from contextlib import asynccontextmanager
 from typing import Annotated
+from urllib.parse import urlparse
 
 import logfire
-import logging
 from dotenv import load_dotenv
+
+# Apply the patch before importing hummingbot components
+from hummingbot.client.config import config_helpers
 
 # Load environment variables early
 load_dotenv()
@@ -12,6 +16,8 @@ load_dotenv()
 VERSION = "1.0.1"
 
 # Monkey patch save_to_yml to prevent writes to library directory
+
+
 def patched_save_to_yml(yml_path, cm):
     """Patched version of save_to_yml that prevents writes to library directory"""
     import logging
@@ -19,26 +25,22 @@ def patched_save_to_yml(yml_path, cm):
     logger.debug(f"Skipping config write to {yml_path} (patched for API mode)")
     # Do nothing - this prevents the original function from trying to write to the library directory
 
-# Apply the patch before importing hummingbot components
-from hummingbot.client.config import config_helpers
+
 config_helpers.save_to_yml = patched_save_to_yml
 
-from hummingbot.core.rate_oracle.rate_oracle import RateOracle
+from fastapi import Depends, FastAPI, HTTPException, Request, status  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.security import HTTPBasic, HTTPBasicCredentials  # noqa: E402
+from hummingbot.client.config.client_config_map import GatewayConfigMap  # noqa: E402
+from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger  # noqa: E402
+from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient  # noqa: E402
+from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES, RateOracle  # noqa: E402
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.middleware.cors import CORSMiddleware
-from hummingbot.data_feed.market_data_provider import MarketDataProvider
-from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger
-
-from utils.security import BackendAPISecurity
-from services.bots_orchestrator import BotsOrchestrator
-from services.accounts_service import AccountsService
-from services.docker_service import DockerService
-from services.gateway_service import GatewayService
-from services.market_data_feed_manager import MarketDataFeedManager
-from utils.bot_archiver import BotArchiver
-from routers import (
+from config import settings  # noqa: E402
+from database import AsyncDatabaseManager  # noqa: E402
+from routers import (  # noqa: E402
     accounts,
     archived_bots,
     backtesting,
@@ -46,17 +48,30 @@ from routers import (
     connectors,
     controllers,
     docker,
+    executors,
     gateway,
-    gateway_swap,
     gateway_clmm,
+    gateway_swap,
     market_data,
     portfolio,
+    rate_oracle,
     scripts,
-    trading
+    trading,
+    websocket,
 )
-
-from config import settings
-
+from services.accounts_service import AccountsService  # noqa: E402
+from services.bots_orchestrator import BotsOrchestrator  # noqa: E402
+from services.docker_service import DockerService  # noqa: E402
+from services.executor_service import ExecutorService  # noqa: E402
+from services.executor_ws_manager import ExecutorWebSocketManager  # noqa: E402
+from services.backtesting_service import BacktestingService  # noqa: E402
+from services.gateway_service import GatewayService  # noqa: E402
+from services.market_data_service import MarketDataService  # noqa: E402
+from services.trading_service import TradingService  # noqa: E402
+from services.unified_connector_service import UnifiedConnectorService  # noqa: E402
+from services.websocket_manager import WebSocketManager  # noqa: E402
+from utils.bot_archiver import BotArchiver  # noqa: E402
+from utils.security import BackendAPISecurity  # noqa: E402
 
 # Set up logging configuration
 logging.basicConfig(
@@ -64,9 +79,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-# Enable debug logging for MQTT manager
-logging.getLogger('services.mqtt_manager').setLevel(logging.DEBUG)
-
+# Enable info logging for MQTT manager
+logging.getLogger('services.mqtt_manager').setLevel(logging.INFO)
 
 # Get settings from Pydantic Settings
 username = settings.security.username
@@ -90,18 +104,122 @@ async def lifespan(app: FastAPI):
         BackendAPISecurity.store_password_verification(secrets_manager)
         logging.info("Created password verification file for master_account")
 
-    # Initialize MarketDataProvider with empty connectors (will use non-trading connectors)
-    market_data_provider = MarketDataProvider(connectors={})
+    # =========================================================================
+    # 1. Infrastructure Setup
+    # =========================================================================
 
-    # Initialize MarketDataFeedManager with lifecycle management
-    market_data_feed_manager = MarketDataFeedManager(
-        market_data_provider=market_data_provider,
-        rate_oracle=RateOracle.get_instance(),
+    # Initialize GatewayHttpClient singleton
+    parsed_gateway_url = urlparse(settings.gateway.url)
+    gateway_config = GatewayConfigMap(
+        gateway_api_host=parsed_gateway_url.hostname or "localhost",
+        gateway_api_port=str(parsed_gateway_url.port or 15888),
+        gateway_use_ssl=parsed_gateway_url.scheme == "https"
+    )
+    GatewayHttpClient.get_instance(gateway_config)
+    logging.info(f"Initialized GatewayHttpClient with URL: {settings.gateway.url}")
+
+    # Initialize secrets manager and database
+    secrets_manager = ETHKeyFileSecretManger(password=settings.security.config_password)
+    db_manager = AsyncDatabaseManager(settings.database.url)
+    await db_manager.create_tables()
+    logging.info("Database initialized")
+
+    # Read rate oracle configuration from conf_client.yml
+    from utils.file_system import FileSystemUtil
+    fs_util = FileSystemUtil()
+
+    try:
+        conf_client_path = "credentials/master_account/conf_client.yml"
+        config_data = fs_util.read_yaml_file(conf_client_path)
+
+        # Get rate_oracle_source configuration
+        rate_oracle_source_data = config_data.get("rate_oracle_source", {})
+        source_name = rate_oracle_source_data.get("name", "binance")
+
+        # Get global_token configuration
+        global_token_data = config_data.get("global_token", {})
+        quote_token = global_token_data.get("global_token_name", "USDT")
+
+        # Create rate source instance
+        from routers.rate_oracle import create_rate_source
+        if source_name in RATE_ORACLE_SOURCES:
+            rate_source = create_rate_source(source_name)
+            logging.info(f"Configured RateOracle with source: {source_name}, quote_token: {quote_token}")
+        else:
+            logging.warning(f"Unknown rate oracle source '{source_name}', defaulting to binance")
+            rate_source = create_rate_source("binance")
+            source_name = "binance"
+
+        # Initialize RateOracle with configured source and quote token
+        rate_oracle = RateOracle.get_instance()
+        rate_oracle.source = rate_source
+        rate_oracle.quote_token = quote_token
+
+    except FileNotFoundError:
+        logging.warning("conf_client.yml not found, using default RateOracle configuration (binance, USDT)")
+        rate_oracle = RateOracle.get_instance()
+    except Exception as e:
+        logging.warning(f"Error reading conf_client.yml: {e}, using default RateOracle configuration")
+        rate_oracle = RateOracle.get_instance()
+
+    # =========================================================================
+    # 2. UnifiedConnectorService - Single source of truth for all connectors
+    # =========================================================================
+
+    connector_service = UnifiedConnectorService(
+        secrets_manager=secrets_manager,
+        db_manager=db_manager
+    )
+    logging.info("UnifiedConnectorService initialized")
+
+    # =========================================================================
+    # 3. Services that depend on connector_service
+    # =========================================================================
+
+    # MarketDataService - candles, order books, prices
+    market_data_service = MarketDataService(
+        connector_service=connector_service,
+        rate_oracle=rate_oracle,
         cleanup_interval=settings.market_data.cleanup_interval,
         feed_timeout=settings.market_data.feed_timeout
     )
+    logging.info("MarketDataService initialized")
 
-    # Initialize services
+    # TradingService - order placement, positions, trading interfaces
+    trading_service = TradingService(
+        connector_service=connector_service,
+        market_data_service=market_data_service
+    )
+    logging.info("TradingService initialized")
+
+    # AccountsService - account management, balances, portfolio (simplified)
+    accounts_service = AccountsService(
+        account_update_interval=settings.app.account_update_interval,
+        gateway_url=settings.gateway.url
+    )
+    # Inject services into AccountsService
+    accounts_service._connector_service = connector_service
+    accounts_service._market_data_service = market_data_service
+    accounts_service._trading_service = trading_service
+    logging.info("AccountsService initialized")
+
+    # =========================================================================
+    # 4. ExecutorService - depends on TradingService (NO circular dependency)
+    # =========================================================================
+
+    executor_service = ExecutorService(
+        trading_service=trading_service,
+        db_manager=db_manager,
+        default_account="master_account",
+        update_interval=1.0,
+        max_retries=10
+    )
+    logging.info("ExecutorService initialized")
+
+    # =========================================================================
+    # 5. Other Services
+    # =========================================================================
+
     bots_orchestrator = BotsOrchestrator(
         broker_host=settings.broker.host,
         broker_port=settings.broker.port,
@@ -109,11 +227,7 @@ async def lifespan(app: FastAPI):
         broker_password=settings.broker.password
     )
 
-    accounts_service = AccountsService(
-        account_update_interval=settings.app.account_update_interval,
-        market_data_feed_manager=market_data_feed_manager,
-        gateway_url=settings.gateway.url
-    )
+    backtesting_service = BacktestingService()
     docker_service = DockerService()
     gateway_service = GatewayService()
     bot_archiver = BotArchiver(
@@ -122,37 +236,67 @@ async def lifespan(app: FastAPI):
         settings.aws.s3_default_bucket_name
     )
 
-    # Initialize database
-    await accounts_service.ensure_db_initialized()
+    # =========================================================================
+    # 6. Start services
+    # =========================================================================
 
-    # Store services in app state
-    app.state.bots_orchestrator = bots_orchestrator
+    # Initialize all trading connectors FIRST (before any service that might use them)
+    # This ensures OrdersRecorder is properly attached before any concurrent access
+    logging.info("Initializing all trading connectors...")
+    await connector_service.initialize_all_trading_connectors()
+
+    bots_orchestrator.start()
+    market_data_service.start()
+    await market_data_service.warmup_rate_oracle()
+    executor_service.start()
+    await executor_service.cleanup_orphaned_executors()
+    await executor_service.recover_positions_from_db()
+    accounts_service.start()
+
+    # =========================================================================
+    # 7. Store services in app state
+    # =========================================================================
+
+    app.state.db_manager = db_manager
+    app.state.connector_service = connector_service
+    app.state.market_data_service = market_data_service
+    app.state.trading_service = trading_service
     app.state.accounts_service = accounts_service
+    app.state.executor_service = executor_service
+    websocket_manager = WebSocketManager(market_data_service)
+    app.state.websocket_manager = websocket_manager
+
+    app.state.backtesting_service = backtesting_service
+    app.state.bots_orchestrator = bots_orchestrator
     app.state.docker_service = docker_service
     app.state.gateway_service = gateway_service
     app.state.bot_archiver = bot_archiver
-    app.state.market_data_feed_manager = market_data_feed_manager
 
-    # Start services
-    bots_orchestrator.start()
-    accounts_service.start()
-    market_data_feed_manager.start()
+    # WebSocket manager for executor streaming
+    executor_ws_manager = ExecutorWebSocketManager(executor_service, market_data_service, bots_orchestrator)
+    app.state.executor_ws_manager = executor_ws_manager
+
+    logging.info("All services started successfully")
 
     yield
 
+    # =========================================================================
     # Shutdown services
+    # =========================================================================
+
+    logging.info("Shutting down services...")
+
+    websocket_manager.shutdown()
+    await executor_ws_manager.shutdown()
     bots_orchestrator.stop()
     await accounts_service.stop()
-
-    # Stop market data feed manager (which will stop all feeds)
-    market_data_feed_manager.stop()
-
-    # Clean up docker service
+    await executor_service.stop()
+    market_data_service.stop()
+    await connector_service.stop_all()
     docker_service.cleanup()
+    await db_manager.close()
 
-    # Close database connections
-    await accounts_service.db_manager.close()
-
+    logging.info("All services stopped")
 
 # Initialize FastAPI with metadata and lifespan
 app = FastAPI(
@@ -171,11 +315,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logfire.configure(send_to_logfire="if-token-present", environment=settings.app.logfire_environment, service_name="hummingbot-api")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Custom handler for validation errors to log detailed error messages.
+    """
+    # Build a readable error message from validation errors
+    error_messages = []
+    for error in exc.errors():
+        loc = " -> ".join(str(part) for part in error.get("loc", []))
+        msg = error.get("msg", "Validation error")
+        error_messages.append(f"{loc}: {msg}")
+
+    # Log the validation error with details
+    logging.warning(
+        f"Validation error on {request.method} {request.url.path}: {'; '.join(error_messages)}"
+    )
+
+    # Return standard FastAPI validation error response
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": exc.errors()},
+    )
+
+logfire.configure(send_to_logfire="if-token-present", environment=settings.app.logfire_environment,
+                  service_name="hummingbot-api")
 logfire.instrument_fastapi(app)
 
+
 def auth_user(
-    credentials: Annotated[HTTPBasicCredentials, Depends(security)],
+        credentials: Annotated[HTTPBasicCredentials, Depends(security)],
 ):
     """Authenticate user using HTTP Basic Auth"""
     current_username_bytes = credentials.username.encode("utf8")
@@ -194,7 +364,9 @@ def auth_user(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Basic"},
         )
+
     return credentials.username
+
 
 # Include all routers with authentication
 app.include_router(docker.router, dependencies=[Depends(auth_user)])
@@ -209,8 +381,15 @@ app.include_router(bot_orchestration.router, dependencies=[Depends(auth_user)])
 app.include_router(controllers.router, dependencies=[Depends(auth_user)])
 app.include_router(scripts.router, dependencies=[Depends(auth_user)])
 app.include_router(market_data.router, dependencies=[Depends(auth_user)])
+app.include_router(rate_oracle.router, dependencies=[Depends(auth_user)])
 app.include_router(backtesting.router, dependencies=[Depends(auth_user)])
 app.include_router(archived_bots.router, dependencies=[Depends(auth_user)])
+
+app.include_router(executors.router, dependencies=[Depends(auth_user)])
+
+# WebSocket router (handles its own auth)
+app.include_router(websocket.router)
+
 
 @app.get("/")
 async def root():

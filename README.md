@@ -25,7 +25,7 @@ After hummingot-api is running, these services are available:
 |---------|-----|-------------|
 | **API** | http://localhost:8000 | REST API |
 | **Swagger UI** | http://localhost:8000/docs | Interactive API documentation |
-| **PostgreSQL** | localhost:5432 | Database |
+| **PostgreSQL** | localhost:15432 (`127.0.0.1:15432`) | Database from the host (`postgres:5432` inside Compose) |
 | **EMQX** | localhost:1883 | MQTT broker |
 | **EMQX Dashboard** | http://localhost:18083 | Broker admin (admin/public) |
 

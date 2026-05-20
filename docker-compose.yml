@@ -3,15 +3,15 @@ services:
     container_name: hummingbot-api
     image: hummingbot/hummingbot-api:latest
     ports:
-      - "8000:8000"
+      - '8000:8000'
     volumes:
       - ./bots:/hummingbot-api/bots
       - /var/run/docker.sock:/var/run/docker.sock
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     env_file:
       - .env
     environment:
@@ -23,7 +23,7 @@ services:
       # Map host.docker.internal to host gateway for Linux compatibility
       # On macOS/Windows, Docker Desktop provides this automatically
       # On Linux, this maps to the docker bridge gateway IP
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     networks:
       - emqx-bridge
     depends_on:
@@ -43,19 +43,19 @@ services:
       - emqx-log:/opt/emqx/log
       - emqx-etc:/opt/emqx/etc
     ports:
-      - "1883:1883"  # mqtt:tcp
-      - "8883:8883"  # mqtt:tcp:ssl
-      - "8083:8083"  # mqtt:ws
-      - "8084:8084"  # mqtt:ws:ssl
-      - "8081:8081"  # http:management
-      - "18083:18083"  # http:dashboard
-      - "61613:61613"  # web-stomp gateway
+      - '1883:1883' # mqtt:tcp
+      - '8883:8883' # mqtt:tcp:ssl
+      - '8083:8083' # mqtt:ws
+      - '8084:8084' # mqtt:ws:ssl
+      - '8081:8081' # http:management
+      - '18083:18083' # http:dashboard
+      - '61613:61613' # web-stomp gateway
     networks:
       emqx-bridge:
         aliases:
           - node1.emqx.local
     healthcheck:
-      test: [ "CMD", "/opt/emqx/bin/emqx_ctl", "status" ]
+      test: ['CMD', '/opt/emqx/bin/emqx_ctl', 'status']
       interval: 5s
       timeout: 25s
       retries: 5
@@ -74,12 +74,15 @@ services:
       - postgres-data:/var/lib/postgresql/data
       # Init script as safety net - only runs on first initialization
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    # Bind to localhost on a non-default host port so host tools (DBeaver, psql from the
+    # machine running Docker Desktop) reach this DB. Port 5432 on the Docker Desktop "host"
+    # side often points at another PostgreSQL instance, which breaks auth for user `hbot`.
     ports:
-      - "5432:5432"
+      - '127.0.0.1:15432:5432'
     networks:
       - emqx-bridge
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hbot -d hummingbot_api"]
+      test: ['CMD-SHELL', 'pg_isready -U hbot -d hummingbot_api']
       interval: 10s
       timeout: 5s
       retries: 5
@@ -89,7 +92,7 @@ networks:
     driver: bridge
 
 volumes:
-  emqx-data: { }
-  emqx-log: { }
-  emqx-etc: { }
-  postgres-data: { }
+  emqx-data: {}
+  emqx-log: {}
+  emqx-etc: {}
+  postgres-data: {}

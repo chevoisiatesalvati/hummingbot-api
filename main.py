@@ -225,7 +225,8 @@ async def lifespan(app: FastAPI):
         broker_host=settings.broker.host,
         broker_port=settings.broker.port,
         broker_username=settings.broker.username,
-        broker_password=settings.broker.password
+        broker_password=settings.broker.password,
+        performance_dump_interval=settings.broker.performance_dump_interval
     )
 
     backtesting_service = BacktestingService()
@@ -245,6 +246,12 @@ async def lifespan(app: FastAPI):
     # This ensures OrdersRecorder is properly attached before any concurrent access
     logging.info("Initializing all trading connectors...")
     await connector_service.initialize_all_trading_connectors()
+
+    # Reconcile persisted active orders against the exchange (e.g. after an API
+    # restart/crash that lost in-memory references). Confirmed-closed orders are
+    # marked terminal; still-open orders are re-tracked so they stay cancelable.
+    # Runs after connectors reload their persisted in-flight orders.
+    await connector_service.reconcile_active_orders()
 
     bots_orchestrator.start()
     market_data_service.start()
@@ -305,6 +312,7 @@ app = FastAPI(
     description="API for managing Hummingbot trading instances",
     version=VERSION,
     lifespan=lifespan,
+    redirect_slashes=False,
 )
 
 # Add CORS middleware

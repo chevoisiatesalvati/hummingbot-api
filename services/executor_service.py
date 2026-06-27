@@ -129,6 +129,10 @@ class ExecutorService:
         self._control_loop_task: Optional[asyncio.Task] = None
         self._is_running = False
 
+        # Connectors whose exchange open orders were imported during this recovery pass.
+        self._recovery_open_orders_imported: set[str] = set()
+        self._recovery_claimed_legs: set[tuple] = set()
+
     def start(self):
         """Start the executor service control loop."""
         if not self._is_running:
@@ -190,35 +194,550 @@ class ExecutorService:
         except Exception as e:
             logger.error(f"Error recovering positions from database: {e}", exc_info=True)
 
+    async def recover_running_executors_from_db(self):
+        """
+        Rehydrate RUNNING executors from the database after an API restart.
+
+        Without this step, ``cleanup_orphaned_executors`` treats every in-memory
+        miss as an orphan and marks live legs TERMINATED (SYSTEM_CLEANUP) even
+        when the exchange position is still open.
+        """
+        if not self.db_manager:
+            logger.debug("No database manager available, skipping executor recovery")
+            return
+
+        recovered = 0
+        failed: list[str] = []
+
+        try:
+            async with self.db_manager.get_session_context() as session:
+                from database.repositories.executor_repository import ExecutorRepository
+                repo = ExecutorRepository(session)
+                records = await repo.get_active_executors()
+                misterminated = await repo.get_misterminated_position_executors()
+
+            seen_ids = set()
+            all_records = []
+            for record in records + misterminated:
+                if record.executor_id in seen_ids:
+                    continue
+                seen_ids.add(record.executor_id)
+                all_records.append(record)
+
+            # Prefer the newest executor when several DB rows claim the same exchange leg.
+            all_records.sort(
+                key=lambda r: r.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            self._recovery_claimed_legs = set()
+
+            for record in all_records:
+                if record.executor_id in self._active_executors:
+                    continue
+                try:
+                    leg_key = self._position_leg_key(record)
+                    if leg_key and leg_key in self._recovery_claimed_legs:
+                        await self._terminate_executor_record(
+                            record.executor_id, "STALE_DUPLICATE"
+                        )
+                        logger.info(
+                            "Terminated stale duplicate executor %s (%s %s)",
+                            record.executor_id,
+                            record.trading_pair,
+                            leg_key[3],
+                        )
+                        continue
+
+                    if record.status == "TERMINATED":
+                        if not await self._record_has_live_exchange_position(record):
+                            continue
+                        async with self.db_manager.get_session_context() as session:
+                            from database.repositories.executor_repository import ExecutorRepository
+                            reactivate_repo = ExecutorRepository(session)
+                            await reactivate_repo.reactivate_executor(record.executor_id)
+                        record.status = "RUNNING"
+                        record.close_type = None
+                        logger.info(
+                            "Reactivating misterminated position executor %s (%s)",
+                            record.executor_id,
+                            record.trading_pair,
+                        )
+                    account_name = record.account_name or self.default_account
+                    connector_name = record.connector_name
+                    if connector_name:
+                        await self._ensure_exchange_open_orders_imported(account_name, connector_name)
+                    if await self._recover_executor_record(record):
+                        recovered += 1
+                        if leg_key:
+                            self._recovery_claimed_legs.add(leg_key)
+                    else:
+                        failed.append(record.executor_id)
+                        if record.executor_type == "position_executor":
+                            await self._terminate_executor_record(
+                                record.executor_id, "RECOVERY_FAILED"
+                            )
+                except Exception as exc:
+                    failed.append(record.executor_id)
+                    logger.error(
+                        "Failed to recover executor %s: %s",
+                        record.executor_id,
+                        exc,
+                        exc_info=True,
+                    )
+
+            if recovered:
+                logger.info("Recovered %d running executor(s) from database", recovered)
+            if failed:
+                logger.warning(
+                    "Could not recover %d executor(s): %s",
+                    len(failed),
+                    failed[:10],
+                )
+        except Exception as e:
+            logger.error(f"Error recovering running executors from database: {e}", exc_info=True)
+
+    async def _recover_executor_record(self, record) -> bool:
+        """Rebuild one RUNNING executor in memory from a DB record."""
+        if not record.config:
+            logger.warning(
+                "Skipping recovery for %s — missing persisted config",
+                record.executor_id,
+            )
+            return False
+
+        try:
+            executor_config = json.loads(record.config)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning(
+                "Skipping recovery for %s — invalid config JSON: %s",
+                record.executor_id,
+                exc,
+            )
+            return False
+
+        if not isinstance(executor_config, dict):
+            return False
+
+        executor_type = executor_config.get("type") or record.executor_type
+        if not executor_type or executor_type not in self.EXECUTOR_REGISTRY:
+            logger.warning(
+                "Skipping recovery for %s — unsupported type %s",
+                record.executor_id,
+                executor_type,
+            )
+            return False
+
+        executor_config = dict(executor_config)
+        executor_config["type"] = executor_type
+        executor_config["id"] = record.executor_id
+        if record.controller_id and not executor_config.get("controller_id"):
+            executor_config["controller_id"] = record.controller_id
+
+        account = record.account_name or self.default_account
+        trading_interface = self._get_trading_interface(account)
+        connector_name = executor_config.get("connector_name") or record.connector_name
+        trading_pair = executor_config.get("trading_pair") or record.trading_pair
+
+        if connector_name:
+            if trading_pair:
+                await trading_interface.add_market(connector_name, trading_pair)
+            else:
+                await trading_interface.ensure_connector(connector_name)
+
+        if "timestamp" not in executor_config or executor_config["timestamp"] is None:
+            executor_config["timestamp"] = trading_interface.current_timestamp
+
+        executor_class, config_class = self.EXECUTOR_REGISTRY[executor_type]
+        try:
+            typed_config = config_class(**executor_config)
+        except Exception as exc:
+            logger.warning(
+                "Skipping recovery for %s — invalid typed config: %s",
+                record.executor_id,
+                exc,
+            )
+            return False
+
+        try:
+            executor = executor_class(
+                strategy=trading_interface,
+                config=typed_config,
+                update_interval=self.update_interval,
+                max_retries=self.max_retries,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping recovery for %s — failed to instantiate: %s",
+                record.executor_id,
+                exc,
+            )
+            return False
+
+        if executor_type == "position_executor":
+            attached = await self._attach_position_executor_to_exchange_position(
+                executor, account
+            )
+            if not attached:
+                return False
+
+        executor_id = typed_config.id
+        controller_id = record.controller_id or getattr(typed_config, "controller_id", "main") or "main"
+        created_at = record.created_at or datetime.now(timezone.utc)
+        self._active_executors[executor_id] = executor
+        self._executor_metadata[executor_id] = {
+            "account_name": account,
+            "connector_name": connector_name,
+            "trading_pair": trading_pair,
+            "executor_type": executor_type,
+            "controller_id": controller_id,
+            "created_at": created_at,
+            "config": executor_config,
+        }
+
+        token = current_executor_id.set(executor_id)
+        executor.start()
+        current_executor_id.reset(token)
+
+        if executor.is_closed:
+            await self._handle_executor_completion(executor_id)
+            return False
+
+        logger.info(
+            "Recovered %s executor %s for %s/%s (controller=%s)",
+            executor_type,
+            executor_id,
+            connector_name,
+            trading_pair,
+            controller_id,
+        )
+        return True
+
+    async def _attach_position_executor_to_exchange_position(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> bool:
+        """Seed a PositionExecutor with the live exchange leg after API restart."""
+        from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+        config = executor.config
+        positions = await self._trading_service.get_positions(
+            account_name, config.connector_name
+        )
+        pos = positions.get(config.trading_pair) if positions else None
+        if not pos:
+            logger.warning(
+                "Cannot recover position executor %s — no open %s position on %s",
+                config.id,
+                config.trading_pair,
+                config.connector_name,
+            )
+            return False
+
+        amount_raw = Decimal(str(pos.get("amount") or 0))
+        entry_price = Decimal(str(pos.get("entry_price") or 0))
+        if amount_raw.copy_abs() <= Decimal("0") or entry_price <= Decimal("0"):
+            logger.warning(
+                "Cannot recover position executor %s — empty position snapshot: %s",
+                config.id,
+                pos,
+            )
+            return False
+
+        position_side = str(pos.get("position_side") or "").upper()
+        exchange_is_short = position_side == "SHORT" or amount_raw < 0
+        config_is_short = config.side == TradeType.SELL
+        if exchange_is_short != config_is_short:
+            logger.warning(
+                "Cannot recover position executor %s — side mismatch "
+                "(config=%s exchange=%s position_side=%s amount=%s)",
+                config.id,
+                config.side,
+                "short" if exchange_is_short else "long",
+                position_side,
+                amount_raw,
+            )
+            return False
+
+        amount = amount_raw.copy_abs()
+        config_amount = Decimal(str(config.amount or 0))
+        if config_amount > 0:
+            rel_diff = (amount - config_amount).copy_abs() / config_amount
+            if rel_diff > Decimal("0.15"):
+                logger.warning(
+                    "Recovering position executor %s with exchange amount %s "
+                    "(config amount %s, %.1f%% drift)",
+                    config.id,
+                    amount,
+                    config_amount,
+                    float(rel_diff * 100),
+                )
+            config.amount = amount
+
+        trading_interface = self._get_trading_interface(account_name)
+        if not config.entry_price:
+            config.entry_price = entry_price
+
+        client_order_id = f"recovered_{config.id[:16]}"
+        open_order = InFlightOrder(
+            client_order_id=client_order_id,
+            trading_pair=config.trading_pair,
+            order_type=OrderType.MARKET,
+            trade_type=config.side,
+            amount=amount,
+            creation_timestamp=trading_interface.current_timestamp,
+            price=entry_price,
+            exchange_order_id=f"recovered_{config.id[:16]}",
+            initial_state=OrderState.FILLED,
+            leverage=int(getattr(config, "leverage", 1) or 1),
+            position=PositionAction.OPEN,
+        )
+        open_order.executed_amount_base = amount
+        open_order.executed_amount_quote = amount * entry_price
+        open_order.completely_filled_event.set()
+
+        tracked = TrackedOrder(order_id=client_order_id)
+        tracked.order = open_order
+        executor._open_order = tracked
+
+        uses_limit_tp = (
+            config.triple_barrier_config.take_profit
+            and config.triple_barrier_config.take_profit_order_type.is_limit_type()
+        )
+        if uses_limit_tp:
+            executor._suppress_take_profit_limit_after_recovery = True
+
+        adopted = executor._adopt_take_profit_limit_order_from_connector()
+        if uses_limit_tp and not adopted:
+            executor._suppress_take_profit_limit_after_recovery = True
+        elif uses_limit_tp and adopted:
+            executor._suppress_take_profit_limit_after_recovery = False
+
+        return True
+
+    async def _ensure_exchange_open_orders_imported(
+        self, account_name: str, connector_name: str
+    ) -> None:
+        key = f"{account_name}:{connector_name}"
+        if key in self._recovery_open_orders_imported:
+            return
+        self._recovery_open_orders_imported.add(key)
+        try:
+            imported = await self._import_exchange_open_orders(account_name, connector_name)
+            if imported:
+                logger.info(
+                    "Imported %d exchange open order(s) for %s/%s before executor recovery",
+                    imported,
+                    account_name,
+                    connector_name,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not import exchange open orders for %s/%s: %s",
+                account_name,
+                connector_name,
+                exc,
+            )
+
+    async def _import_exchange_open_orders(
+        self, account_name: str, connector_name: str
+    ) -> int:
+        """Register live exchange open orders into connector.in_flight_orders for recovery adopt."""
+        from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
+        from hummingbot.core.data_type.in_flight_order import OrderState, PerpetualDerivativeInFlightOrder
+
+        connector = await self._get_trading_interface(account_name).ensure_connector(connector_name)
+        if not hasattr(connector, "fetch_frontend_open_orders"):
+            return 0
+
+        open_orders = await connector.fetch_frontend_open_orders()
+        if not open_orders:
+            return 0
+
+        imported = 0
+        for raw in open_orders:
+            coin = raw.get("coin")
+            if not coin:
+                continue
+            try:
+                trading_pair = await connector.trading_pair_associated_to_exchange_symbol(symbol=coin)
+            except Exception:
+                continue
+            side_raw = raw.get("side")
+            trade_type = TradeType.BUY if side_raw == "B" else TradeType.SELL
+            oid = raw.get("oid")
+            if oid is None:
+                continue
+            exchange_order_id = str(oid)
+            cloid = raw.get("cloid")
+            client_order_id = str(cloid) if cloid else exchange_order_id
+            if client_order_id in connector.in_flight_orders:
+                continue
+            order_type_raw = str(raw.get("orderType") or "Limit")
+            if "market" in order_type_raw.lower():
+                order_type = OrderType.MARKET
+            elif "maker" in order_type_raw.lower():
+                order_type = OrderType.LIMIT_MAKER
+            else:
+                order_type = OrderType.LIMIT
+            amount = Decimal(str(raw.get("sz") or raw.get("origSz") or "0"))
+            price = Decimal(str(raw.get("limitPx") or "0"))
+            if amount <= 0:
+                continue
+            timestamp_ms = raw.get("timestamp") or 0
+            leverage = connector.get_leverage(trading_pair=trading_pair)
+            position_action = PositionAction.OPEN
+            order = PerpetualDerivativeInFlightOrder(
+                client_order_id=client_order_id,
+                exchange_order_id=exchange_order_id,
+                trading_pair=trading_pair,
+                order_type=order_type,
+                trade_type=trade_type,
+                amount=amount,
+                price=price,
+                creation_timestamp=timestamp_ms / 1000 if timestamp_ms else connector.current_timestamp,
+                initial_state=OrderState.OPEN,
+                leverage=leverage,
+                position=position_action,
+            )
+            connector._order_tracker.start_tracking_order(order)
+            imported += 1
+
+        return imported
+
+    def _parse_config_side_is_short(self, config: dict) -> bool:
+        side = config.get("side")
+        if side is None:
+            return False
+        if isinstance(side, int):
+            return side == 2
+        if isinstance(side, str):
+            return side.upper() in ("SELL", "SHORT", "2")
+        side_name = getattr(side, "name", str(side)).upper()
+        return side_name in ("SELL", "SHORT")
+
+    def _position_leg_key(self, record) -> Optional[tuple]:
+        """Unique exchange leg: (account, connector, pair, LONG|SHORT)."""
+        if record.executor_type != "position_executor":
+            return None
+        try:
+            config = json.loads(record.config) if record.config else {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        side_label = "SHORT" if self._parse_config_side_is_short(config) else "LONG"
+        return (
+            record.account_name or self.default_account,
+            record.connector_name or config.get("connector_name"),
+            record.trading_pair or config.get("trading_pair"),
+            side_label,
+        )
+
+    async def _terminate_executor_record(self, executor_id: str, close_type: str) -> None:
+        if not self.db_manager:
+            return
+        try:
+            async with self.db_manager.get_session_context() as session:
+                from database.repositories.executor_repository import ExecutorRepository
+                repo = ExecutorRepository(session)
+                await repo.update_executor(
+                    executor_id=executor_id,
+                    status="TERMINATED",
+                    close_type=close_type,
+                )
+        except Exception as exc:
+            logger.error(
+                "Failed to terminate executor record %s (%s): %s",
+                executor_id,
+                close_type,
+                exc,
+            )
+
+    async def _record_has_live_exchange_position(self, record) -> bool:
+        """True when the exchange still holds a leg matching this executor's side."""
+        if record.executor_type != "position_executor":
+            return False
+        try:
+            config = json.loads(record.config) if record.config else {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+
+        try:
+            positions = await self._trading_service.get_positions(
+                record.account_name, record.connector_name
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not verify exchange position for %s: %s",
+                record.executor_id,
+                exc,
+            )
+            return False
+
+        pos = positions.get(record.trading_pair) if positions else None
+        if not pos:
+            return False
+
+        amount_raw = Decimal(str(pos.get("amount") or 0))
+        if amount_raw.copy_abs() <= Decimal("0"):
+            return False
+
+        config_is_short = self._parse_config_side_is_short(config)
+        position_side = str(pos.get("position_side") or "").upper()
+        exchange_is_short = position_side == "SHORT" or amount_raw < 0
+        return exchange_is_short == config_is_short
+
     async def cleanup_orphaned_executors(self):
         """
         Clean up orphaned executors from database on startup.
 
-        Identifies executors marked as RUNNING in the database but not present
-        in memory (i.e., from previous API sessions that were terminated).
+        Only marks TERMINATED when a RUNNING record is not in memory **and**
+        there is no live exchange position left to manage. Records that still
+        have an open leg are left RUNNING so operators/agents can see the gap.
         """
         if not self.db_manager:
             logger.debug("No database manager available, skipping orphaned executor cleanup")
             return
 
         try:
-            # Get list of currently active executor IDs in memory
             active_executor_ids = list(self._active_executors.keys())
 
             async with self.db_manager.get_session_context() as session:
                 from database.repositories.executor_repository import ExecutorRepository
                 repo = ExecutorRepository(session)
 
-                # Clean up orphaned executors
-                cleaned_count = await repo.cleanup_orphaned_executors(
-                    active_executor_ids=active_executor_ids,
-                    close_type="SYSTEM_CLEANUP"
-                )
+                records = await repo.get_active_executors()
+                protected_ids: list[str] = []
+                for record in records:
+                    if record.executor_id in active_executor_ids:
+                        continue
+                    if await self._record_has_live_exchange_position(record):
+                        protected_ids.append(record.executor_id)
+                        logger.error(
+                            "Executor %s still has an open %s position on %s but "
+                            "could not be recovered — leaving DB status RUNNING",
+                            record.executor_id,
+                            record.trading_pair,
+                            record.connector_name,
+                        )
 
-                if cleaned_count > 0:
-                    logger.info(f"Cleaned up {cleaned_count} orphaned executors from database")
-                else:
-                    logger.debug("No orphaned executors found in database")
+                cleaned_count = 0
+                if records:
+                    keep_ids = active_executor_ids + protected_ids
+                    cleaned_count = await repo.cleanup_orphaned_executors(
+                        active_executor_ids=keep_ids,
+                        close_type="SYSTEM_CLEANUP",
+                    )
+
+            if cleaned_count > 0:
+                logger.info(f"Cleaned up {cleaned_count} orphaned executors from database")
+            else:
+                logger.debug("No orphaned executors found in database")
 
         except Exception as e:
             logger.error(f"Error cleaning up orphaned executors: {e}", exc_info=True)
@@ -467,8 +986,12 @@ class ExecutorService:
 
                     for record in db_executors:
                         # Skip if already in active executors (safety check)
-                        if record.executor_id not in self._active_executors:
-                            result.append(self._format_db_record(record))
+                        if record.executor_id in self._active_executors:
+                            continue
+                        # Stale RUNNING rows left in DB must not appear as live executors.
+                        if record.status == "RUNNING":
+                            continue
+                        result.append(self._format_db_record(record))
             except Exception as e:
                 logger.error(f"Error fetching executors from database: {e}")
 

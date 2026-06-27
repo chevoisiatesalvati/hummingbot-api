@@ -257,6 +257,7 @@ async def lifespan(app: FastAPI):
     market_data_service.start()
     await market_data_service.warmup_rate_oracle()
     executor_service.start()
+    await executor_service.recover_running_executors_from_db()
     await executor_service.cleanup_orphaned_executors()
     await executor_service.recover_positions_from_db()
     accounts_service.start()

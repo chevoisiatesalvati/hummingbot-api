@@ -134,6 +134,34 @@ class ExecutorRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_misterminated_position_executors(
+            self,
+            close_types: Optional[List[str]] = None,
+    ) -> List[ExecutorRecord]:
+        """TERMINATED position executors that may have been wrongly closed on restart."""
+        if close_types is None:
+            close_types = ["INSUFFICIENT_BALANCE"]
+        stmt = select(ExecutorRecord).where(
+            ExecutorRecord.status == "TERMINATED",
+            ExecutorRecord.executor_type == "position_executor",
+            ExecutorRecord.close_type.in_(close_types),
+        ).order_by(desc(ExecutorRecord.created_at))
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def reactivate_executor(self, executor_id: str) -> Optional[ExecutorRecord]:
+        """Set a terminated executor back to RUNNING for recovery after a bad shutdown."""
+        stmt = select(ExecutorRecord).where(ExecutorRecord.executor_id == executor_id)
+        result = await self.session.execute(stmt)
+        executor = result.scalar_one_or_none()
+        if executor:
+            executor.status = "RUNNING"
+            executor.close_type = None
+            executor.closed_at = None
+            await self.session.flush()
+            await self.session.refresh(executor)
+        return executor
+
     async def get_active_executors(
             self,
             account_name: Optional[str] = None,

@@ -445,6 +445,89 @@ class TradingService:
         """Get all active trading interfaces."""
         return self._trading_interfaces.copy()
 
+    async def get_positions(
+        self,
+        account_name: str,
+        connector_name: str,
+    ) -> Dict[str, Dict]:
+        """
+        Fetch open perpetual positions keyed by trading pair.
+
+        Used by ExecutorService on startup to reattach position executors to
+        live exchange legs and to verify whether a DB record still has an open leg.
+
+        Returns:
+            ``{trading_pair: {amount, entry_price, position_side, ...}}``
+            Empty dict when the connector is missing, not perpetual, or has no positions.
+        """
+        if "_perpetual" not in connector_name:
+            logger.debug(
+                "Skipping position fetch for non-perpetual connector %s",
+                connector_name,
+            )
+            return {}
+
+        try:
+            connector = await self._connector_service.get_trading_connector(
+                account_name,
+                connector_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not load connector %s/%s for position fetch: %s",
+                account_name,
+                connector_name,
+                exc,
+            )
+            return {}
+
+        if not hasattr(connector, "account_positions"):
+            logger.debug(
+                "Connector %s does not expose account_positions",
+                connector_name,
+            )
+            return {}
+
+        try:
+            if hasattr(connector, "_update_positions"):
+                await connector._update_positions()
+        except Exception as exc:
+            logger.warning(
+                "Failed to refresh positions for %s/%s: %s",
+                account_name,
+                connector_name,
+                exc,
+            )
+
+        positions: Dict[str, Dict] = {}
+        for trading_pair, position_info in connector.account_positions.items():
+            amount = position_info.amount if hasattr(position_info, "amount") else Decimal("0")
+            if amount == 0:
+                continue
+
+            position_side = (
+                position_info.position_side.name
+                if hasattr(position_info, "position_side") and position_info.position_side is not None
+                else "UNKNOWN"
+            )
+
+            positions[trading_pair] = {
+                "trading_pair": trading_pair,
+                "amount": float(amount),
+                "entry_price": float(position_info.entry_price)
+                if hasattr(position_info, "entry_price") and position_info.entry_price is not None
+                else None,
+                "position_side": position_side,
+                "unrealized_pnl": float(position_info.unrealized_pnl)
+                if hasattr(position_info, "unrealized_pnl") and position_info.unrealized_pnl is not None
+                else None,
+                "leverage": float(position_info.leverage)
+                if hasattr(position_info, "leverage") and position_info.leverage is not None
+                else None,
+            }
+
+        return positions
+
     # ==================== Lifecycle ====================
 
     async def stop(self):

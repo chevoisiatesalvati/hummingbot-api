@@ -140,7 +140,11 @@ class ExecutorRepository:
     ) -> List[ExecutorRecord]:
         """TERMINATED position executors that may have been wrongly closed on restart."""
         if close_types is None:
-            close_types = ["INSUFFICIENT_BALANCE"]
+            close_types = [
+                "INSUFFICIENT_BALANCE",
+                "SYSTEM_CLEANUP",
+                "RECOVERY_FAILED",
+            ]
         stmt = select(ExecutorRecord).where(
             ExecutorRecord.status == "TERMINATED",
             ExecutorRecord.executor_type == "position_executor",

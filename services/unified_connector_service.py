@@ -584,6 +584,9 @@ class UnifiedConnectorService:
         # Initialize symbol map and trading rules
         await connector._initialize_trading_pair_symbol_map()
         await connector._update_trading_rules()
+        from utils.hyperliquid_price_quantize import patch_hyperliquid_quantize_order_price
+
+        patch_hyperliquid_quantize_order_price(connector)
         await connector._update_balances()
 
         # Perpetual-specific setup

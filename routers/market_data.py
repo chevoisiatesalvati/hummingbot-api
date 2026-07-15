@@ -79,18 +79,21 @@ async def get_candles(request: Request, candles_config: CandlesConfigRequest):
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        # Wait for the candles feed to be ready with a timeout
-        timeout = settings.market_data.candles_ready_timeout
+        timeout = market_data_service.compute_candles_ready_timeout(
+            candles_config.connector_name,
+            candles_config.trading_pair,
+            candles_config.max_records,
+            settings.market_data.candles_ready_timeout,
+        )
         start = time.time()
         while not candles_feed.ready:
             if time.time() - start > timeout:
-                # Clean up the stale feed so it doesn't stay cached
                 market_data_service.stop_candle_feed(candles_cfg)
                 raise HTTPException(
                     status_code=504,
                     detail=f"Candle feed for {candles_config.connector_name} "
                            f"{candles_config.trading_pair} did not become ready within "
-                           f"{timeout}s. The trading pair may not exist on this exchange."
+                           f"{int(timeout)}s. The trading pair may not exist on this exchange."
                 )
             await asyncio.sleep(0.1)
 
@@ -154,7 +157,17 @@ async def get_historical_candles(request: Request, config: HistoricalCandlesConf
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        timeout = settings.market_data.candles_ready_timeout
+        from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
+
+        interval_seconds = CandlesBase.interval_to_seconds.get(config.interval, 60)
+        span_seconds = max(config.end_time - config.start_time, interval_seconds)
+        estimated_records = max(50, int(span_seconds / interval_seconds) + 1)
+        timeout = market_data_service.compute_candles_ready_timeout(
+            config.connector_name,
+            config.trading_pair,
+            estimated_records,
+            settings.market_data.candles_ready_timeout,
+        )
         historical_data = await asyncio.wait_for(
             candles.get_historical_candles(config=config),
             timeout=timeout

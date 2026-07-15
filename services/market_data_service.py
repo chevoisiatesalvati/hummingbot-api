@@ -381,6 +381,19 @@ class MarketDataService:
             raise UnsupportedConnectorException(connector_name)
 
     @staticmethod
+    def compute_candles_ready_timeout(
+            connector_name: str,
+            trading_pair: str,
+            max_records: int,
+            base_timeout: int,
+    ) -> float:
+        from utils.hyperliquid_candles import compute_candles_ready_timeout
+
+        return compute_candles_ready_timeout(
+            connector_name, max_records, base_timeout, trading_pair
+        )
+
+    @staticmethod
     async def _validate_pair(feed, connector_name: str, trading_pair: str) -> None:
         """
         Validate that a trading pair exists on the exchange by loading the feed's exchange
@@ -438,6 +451,10 @@ class MarketDataService:
         if feed_key not in self._candle_feeds:
             self.validate_connector(config.connector)
             feed = CandlesFactory.get_candle(config)
+            if config.connector == "hyperliquid_perpetual":
+                from utils.hyperliquid_candles import patch_hyperliquid_perpetual_candles
+
+                patch_hyperliquid_perpetual_candles(feed)
             await self._validate_pair(feed, config.connector, config.trading_pair)
             feed.start()
             self._candle_feeds[feed_key] = feed

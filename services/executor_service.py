@@ -6,6 +6,7 @@ without Docker containers or full strategy setup.
 import asyncio
 import json
 import logging
+import time
 import types
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -170,6 +171,76 @@ class ExecutorService:
         # Connectors whose exchange open orders were imported during this recovery pass.
         self._recovery_open_orders_imported: set[str] = set()
         self._recovery_claimed_legs: set[tuple] = set()
+        # Shared HL position snapshots during startup recovery/cleanup (avoids N× API calls).
+        self._startup_positions_cache: Optional[Dict[tuple, Dict[str, Dict]]] = None
+        self._recovery_task: Optional[asyncio.Task] = None
+        self._recovery_in_progress = False
+        # Executors waiting for their initial DB insert (control loop must not complete them yet).
+        self._executors_pending_creation_persist: set[str] = set()
+        # Cached HL userFills keyed by (account, connector); avoids 429 bursts on executor search.
+        self._hl_fills_cache: Dict[tuple[str, str], tuple[float, Dict[str, List[Dict[str, Any]]]]] = {}
+        self._hl_fills_cache_ttl_seconds = 300.0
+        self._hl_fills_fetch_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+
+    def schedule_startup_recovery(self) -> None:
+        """Kick off DB executor recovery in the background (non-blocking startup)."""
+        if self._recovery_task and not self._recovery_task.done():
+            logger.debug("Startup recovery already in progress")
+            return
+        self._recovery_task = asyncio.create_task(
+            self._run_startup_recovery_guarded(),
+            name="executor_startup_recovery",
+        )
+        logger.info("Scheduled background executor recovery")
+
+    @property
+    def recovery_in_progress(self) -> bool:
+        return self._recovery_in_progress
+
+    async def _run_startup_recovery_guarded(self) -> None:
+        self._recovery_in_progress = True
+        try:
+            await self.run_startup_recovery()
+            logger.info("Background executor recovery finished")
+        except asyncio.CancelledError:
+            logger.info("Background executor recovery cancelled")
+            raise
+        except Exception as exc:
+            logger.error("Background executor recovery failed: %s", exc, exc_info=True)
+        finally:
+            self._recovery_in_progress = False
+
+    def _begin_startup_positions_batch(self) -> None:
+        self._startup_positions_cache = {}
+
+    def _end_startup_positions_batch(self) -> None:
+        self._startup_positions_cache = None
+
+    async def _resolve_positions(
+        self,
+        account_name: str,
+        connector_name: str,
+    ) -> Dict[str, Dict]:
+        """Return exchange positions, reusing one snapshot per account/connector during startup."""
+        cache = self._startup_positions_cache
+        if cache is not None:
+            key = (account_name, connector_name)
+            if key not in cache:
+                cache[key] = await self._trading_service.get_positions(
+                    account_name, connector_name
+                )
+            return cache[key]
+        return await self._trading_service.get_positions(account_name, connector_name)
+
+    async def run_startup_recovery(self) -> None:
+        """Run DB recovery and orphan cleanup with batched position snapshots."""
+        self._begin_startup_positions_batch()
+        try:
+            await self.recover_running_executors_from_db()
+            await self.cleanup_orphaned_executors()
+            await self.recover_positions_from_db()
+        finally:
+            self._end_startup_positions_batch()
 
     def start(self):
         """Start the executor service control loop."""
@@ -321,7 +392,6 @@ class ExecutorService:
                         exc,
                         exc_info=True,
                     )
-
             if recovered:
                 logger.info("Recovered %d running executor(s) from database", recovered)
             if failed:
@@ -460,7 +530,7 @@ class ExecutorService:
         from hummingbot.strategy_v2.models.executors import TrackedOrder
 
         config = executor.config
-        positions = await self._trading_service.get_positions(
+        positions = await self._resolve_positions(
             account_name, config.connector_name
         )
         pos = positions.get(config.trading_pair) if positions else None
@@ -551,6 +621,774 @@ class ExecutorService:
 
         self._mark_position_executor_recovered(executor)
         return True
+
+    async def _validate_position_executor_order_size(
+        self,
+        account_name: str,
+        executor_config: Dict[str, Any],
+    ) -> None:
+        """Reject position executors whose open order would fail connector min notional."""
+        connector_name = executor_config.get("connector_name")
+        trading_pair = executor_config.get("trading_pair")
+        amount_raw = executor_config.get("amount")
+        if not connector_name or not trading_pair or amount_raw is None:
+            return
+        if "hyperliquid" not in connector_name:
+            return
+
+        amount = Decimal(str(amount_raw))
+        trading_interface = self._get_trading_interface(account_name)
+        connector = await trading_interface.ensure_connector(connector_name)
+        rules = connector.trading_rules.get(trading_pair)
+        if not rules:
+            return
+
+        quantized = connector.quantize_order_amount(trading_pair, amount)
+        try:
+            price = connector.get_price(trading_pair, True)
+        except Exception:
+            price = Decimal(str(executor_config.get("entry_price") or 0))
+        if price <= 0:
+            return
+
+        notional = quantized * price
+        min_notional = rules.min_notional_size
+        if notional < min_notional:
+            min_amount = (min_notional / price).quantize(quantized)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Order notional ${notional:.2f} is below Hyperliquid minimum "
+                    f"${min_notional} for {trading_pair} "
+                    f"(amount {amount} quantizes to {quantized} at ${price:.2f}). "
+                    f"Use at least ~{min_amount} base units."
+                ),
+            )
+
+    async def _reconcile_position_executor_stale_open_order(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> bool:
+        """Clear ghost open orders when connector tracking ended but the executor still waits."""
+        from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+        from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+
+        STUCK_SUBMIT_SECONDS = 30
+
+        if not isinstance(executor, PositionExecutor):
+            return False
+        if executor.is_closed:
+            return False
+        if executor.open_filled_amount > Decimal("0"):
+            return False
+
+        open_tracked = executor._open_order
+        if not open_tracked or not open_tracked.order_id:
+            return False
+
+        order_id = open_tracked.order_id
+        connector = await self._get_trading_interface(account_name).ensure_connector(
+            executor.config.connector_name
+        )
+        tracker = connector._order_tracker
+        live = tracker.fetch_order(client_order_id=order_id)
+        lost = tracker.fetch_lost_order(client_order_id=order_id)
+
+        reconciled = False
+        failure_reason = None
+
+        if live and not live.is_done:
+            if open_tracked.order is None:
+                open_tracked.order = live
+            order_age = connector.current_timestamp - live.creation_timestamp
+            if (
+                not live.exchange_order_id
+                and order_age > STUCK_SUBMIT_SECONDS
+                and live.executed_amount_base <= Decimal("0")
+                and not live.is_failure
+            ):
+                failure_reason = "SUBMIT_TIMEOUT"
+                reconciled = True
+                order_update = OrderUpdate(
+                    client_order_id=order_id,
+                    trading_pair=live.trading_pair,
+                    update_timestamp=connector.current_timestamp,
+                    new_state=OrderState.FAILED,
+                    misc_updates={
+                        "error_message": (
+                            f"Order submission timed out after {order_age:.1f}s "
+                            "without an exchange order id"
+                        ),
+                        "error_type": "TimeoutError",
+                    },
+                )
+                tracker.process_order_update(order_update)
+            elif not reconciled:
+                return False
+
+        if not reconciled:
+            if live and (live.is_failure or (live.is_cancelled and live.executed_amount_base <= 0)):
+                failure_reason = live.current_state.name
+                reconciled = True
+            elif lost and (lost.is_failure or (lost.is_cancelled and lost.executed_amount_base <= 0)):
+                failure_reason = lost.current_state.name
+                reconciled = True
+            elif live is None and lost is None and open_tracked.order is None:
+                failure_reason = "NOT_TRACKED"
+                reconciled = True
+
+        if not reconciled:
+            return False
+
+        executor._failed_orders.append(open_tracked)
+        executor._open_order = None
+        executor._current_retries += 1
+        logger.warning(
+            "Reconciled stale open order for executor %s (%s): order=%s reason=%s retry=%s/%s",
+            executor.config.id,
+            executor.config.trading_pair,
+            order_id,
+            failure_reason,
+            executor._current_retries,
+            executor._max_retries,
+        )
+        return True
+
+    async def _reconcile_order_executor_stale_order(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> bool:
+        """Clear ghost orders for order executors stuck without an exchange order id."""
+        from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+        from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
+        from hummingbot.strategy_v2.models.base import RunnableStatus
+
+        STUCK_SUBMIT_SECONDS = 30
+
+        if not isinstance(executor, OrderExecutor):
+            return False
+        if executor.is_closed or executor.status != RunnableStatus.RUNNING:
+            return False
+        if executor.executed_amount_base > Decimal("0"):
+            return False
+
+        tracked = executor._order
+        if not tracked or not tracked.order_id:
+            return False
+
+        connector = await self._get_trading_interface(account_name).ensure_connector(
+            executor.config.connector_name
+        )
+        tracker = connector._order_tracker
+        live = tracker.fetch_order(client_order_id=tracked.order_id)
+        if live and not tracked.order:
+            tracked.order = live
+
+        if not live or live.is_done:
+            return False
+
+        order_age = connector.current_timestamp - live.creation_timestamp
+        if (
+            live.exchange_order_id
+            or order_age <= STUCK_SUBMIT_SECONDS
+            or live.executed_amount_base > Decimal("0")
+            or live.is_failure
+        ):
+            return False
+
+        order_update = OrderUpdate(
+            client_order_id=tracked.order_id,
+            trading_pair=live.trading_pair,
+            update_timestamp=connector.current_timestamp,
+            new_state=OrderState.FAILED,
+            misc_updates={
+                "error_message": (
+                    f"Order submission timed out after {order_age:.1f}s "
+                    "without an exchange order id"
+                ),
+                "error_type": "TimeoutError",
+            },
+        )
+        tracker.process_order_update(order_update)
+        return True
+
+    async def _assist_executor_shutdown(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> None:
+        """Unblock SHUTTING_DOWN executors stuck on ghost or unbound orders."""
+        from hummingbot.core.data_type.in_flight_order import OrderState, OrderUpdate
+        from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
+        from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+        from hummingbot.strategy_v2.models.base import RunnableStatus
+
+        STUCK_SUBMIT_SECONDS = 30
+
+        if executor.is_closed or executor.status != RunnableStatus.SHUTTING_DOWN:
+            return
+
+        if isinstance(executor, OrderExecutor):
+            config = executor.config
+            connector = await self._get_trading_interface(account_name).ensure_connector(
+                config.connector_name
+            )
+            tracked = executor._order
+            if not tracked or not tracked.order_id:
+                if executor.executed_amount_base <= Decimal("0"):
+                    executor.close_type = CloseType.EARLY_STOP
+                    executor.stop()
+                return
+
+            live = connector._order_tracker.fetch_order(client_order_id=tracked.order_id)
+            if live and not tracked.order:
+                tracked.order = live
+
+            if tracked.is_filled:
+                return
+
+            if tracked.is_open and live:
+                order_age = connector.current_timestamp - live.creation_timestamp
+                if (
+                    not live.exchange_order_id
+                    and order_age > STUCK_SUBMIT_SECONDS
+                    and live.executed_amount_base <= Decimal("0")
+                ):
+                    connector._order_tracker.process_order_update(
+                        OrderUpdate(
+                            client_order_id=tracked.order_id,
+                            trading_pair=live.trading_pair,
+                            update_timestamp=connector.current_timestamp,
+                            new_state=OrderState.FAILED,
+                            misc_updates={
+                                "error_message": "Order cleared during executor shutdown",
+                                "error_type": "ShutdownClear",
+                            },
+                        )
+                    )
+                    executor._order = None
+                    executor.close_type = CloseType.EARLY_STOP
+                    executor.stop()
+                return
+
+            if not tracked.is_open and not tracked.is_filled:
+                executor._order = None
+                executor.close_type = CloseType.EARLY_STOP
+                executor.stop()
+            return
+
+        if not isinstance(executor, PositionExecutor):
+            return
+
+        config = executor.config
+        connector = await self._get_trading_interface(account_name).ensure_connector(
+            config.connector_name
+        )
+        open_tracked = executor._open_order
+        if open_tracked and open_tracked.order_id:
+            live = connector._order_tracker.fetch_order(client_order_id=open_tracked.order_id)
+            if live and not open_tracked.order:
+                open_tracked.order = live
+            if (
+                live
+                and open_tracked.is_open
+                and not live.exchange_order_id
+                and connector.current_timestamp - live.creation_timestamp > STUCK_SUBMIT_SECONDS
+                and live.executed_amount_base <= Decimal("0")
+            ):
+                connector._order_tracker.process_order_update(
+                    OrderUpdate(
+                        client_order_id=open_tracked.order_id,
+                        trading_pair=live.trading_pair,
+                        update_timestamp=connector.current_timestamp,
+                        new_state=OrderState.FAILED,
+                        misc_updates={
+                            "error_message": "Open order cleared during executor shutdown",
+                            "error_type": "ShutdownClear",
+                        },
+                    )
+                )
+                executor._open_order = None
+            elif not open_tracked.is_done and open_tracked.order is None:
+                executor._open_order = None
+
+        if (
+            executor.open_filled_amount <= Decimal("0")
+            and executor.all_orders_completed()
+            and executor.close_type != CloseType.POSITION_HOLD
+        ):
+            executor.stop()
+
+    async def _sync_position_executor_open_fill_from_exchange(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> bool:
+        """Backfill open-order executed amounts from exchange when fill tracking left them at zero."""
+        from hummingbot.core.data_type.common import OrderType, PositionAction, TradeType
+        from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
+        from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+        if not isinstance(executor, PositionExecutor):
+            return False
+        if executor.is_closed:
+            return False
+        try:
+            if executor.open_filled_amount > Decimal("0"):
+                return False
+        except Exception:
+            return False
+
+        config = executor.config
+        positions = await self._resolve_positions(
+            account_name, config.connector_name
+        )
+        pos = positions.get(config.trading_pair) if positions else None
+        if not pos:
+            return False
+
+        amount_raw = Decimal(str(pos.get("amount") or 0))
+        entry_price = Decimal(str(pos.get("entry_price") or 0))
+        if amount_raw.copy_abs() <= Decimal("0") or entry_price <= Decimal("0"):
+            return False
+
+        position_side = str(pos.get("position_side") or "").upper()
+        exchange_is_short = position_side == "SHORT" or amount_raw < 0
+        config_is_short = config.side == TradeType.SELL
+        if exchange_is_short != config_is_short:
+            return False
+
+        amount = amount_raw.copy_abs()
+        if config.amount and config.amount > 0:
+            config.amount = amount
+        if not config.entry_price:
+            config.entry_price = entry_price
+
+        tracked = executor._open_order
+        if tracked and tracked.order:
+            order = tracked.order
+            order.amount = amount
+            order.price = entry_price
+            order.executed_amount_base = amount
+            order.executed_amount_quote = amount * entry_price
+            order.current_state = OrderState.FILLED
+            order.completely_filled_event.set()
+        else:
+            trading_interface = self._get_trading_interface(account_name)
+            client_order_id = f"synced_{config.id[:16]}"
+            open_order = InFlightOrder(
+                client_order_id=client_order_id,
+                trading_pair=config.trading_pair,
+                order_type=OrderType.MARKET,
+                trade_type=config.side,
+                amount=amount,
+                creation_timestamp=trading_interface.current_timestamp,
+                price=entry_price,
+                exchange_order_id=client_order_id,
+                initial_state=OrderState.FILLED,
+                leverage=int(getattr(config, "leverage", 1) or 1),
+                position=PositionAction.OPEN,
+            )
+            open_order.executed_amount_base = amount
+            open_order.executed_amount_quote = amount * entry_price
+            open_order.completely_filled_event.set()
+            tracked = TrackedOrder(order_id=client_order_id)
+            tracked.order = open_order
+            executor._open_order = tracked
+
+        open_filled = executor.open_filled_amount
+        logger.info(
+            "Synced open fill for executor %s (%s): amount=%s entry=%s open_filled=%s",
+            config.id,
+            config.trading_pair,
+            amount,
+            entry_price,
+            open_filled,
+        )
+        return True
+
+    @staticmethod
+    def _is_synthetic_order_id(order_id: Optional[str]) -> bool:
+        if not order_id:
+            return False
+        lowered = str(order_id).lower()
+        return lowered.startswith("recovered_") or lowered.startswith("hbpt")
+
+    def _executor_may_need_hl_pnl_repair(self, record) -> bool:
+        """Return True only for terminated HL executors likely missing fill-based PnL."""
+        if (
+            record.executor_type != "position_executor"
+            or record.status != "TERMINATED"
+            or not record.connector_name
+            or "hyperliquid" not in record.connector_name
+        ):
+            return False
+        try:
+            final_state = json.loads(record.final_state) if record.final_state else {}
+        except (json.JSONDecodeError, TypeError):
+            final_state = {}
+        order_ids = final_state.get("order_ids") or []
+        if order_ids and self._is_synthetic_order_id(str(order_ids[0])):
+            return True
+        if (
+            (record.net_pnl_quote or 0) == 0
+            and record.close_type
+            and record.close_type not in ("STALE_DUPLICATE", "MISTAKE", "MANUAL")
+        ):
+            return True
+        return False
+
+    def _get_initialized_hyperliquid_connector(
+        self,
+        account_name: str,
+        connector_name: str,
+    ):
+        """Return an already-initialized HL connector without triggering a new init."""
+        connector_service = self._trading_service.connector_service
+        if not connector_service.is_trading_connector_initialized(account_name, connector_name):
+            return None
+        return connector_service.get_account_connectors(account_name).get(connector_name)
+
+    async def _load_hyperliquid_fills_by_oid(
+        self,
+        account_name: str,
+        connector_name: str,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetch HL userFills once and index by exchange order id."""
+        if "hyperliquid" not in connector_name:
+            return {}
+        if self._recovery_in_progress:
+            return {}
+
+        cache_key = (account_name, connector_name)
+        cached = self._hl_fills_cache.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < self._hl_fills_cache_ttl_seconds:
+            return cached[1]
+
+        if cache_key not in self._hl_fills_fetch_locks:
+            self._hl_fills_fetch_locks[cache_key] = asyncio.Lock()
+
+        async with self._hl_fills_fetch_locks[cache_key]:
+            cached = self._hl_fills_cache.get(cache_key)
+            if cached and (time.monotonic() - cached[0]) < self._hl_fills_cache_ttl_seconds:
+                return cached[1]
+
+            connector = self._get_initialized_hyperliquid_connector(account_name, connector_name)
+            if connector is None:
+                logger.debug(
+                    "Skipping HL fills fetch for %s/%s: connector not initialized",
+                    account_name,
+                    connector_name,
+                )
+                return {}
+
+            try:
+                from hummingbot.connector.derivative.hyperliquid_perpetual import hyperliquid_perpetual_constants as hl_constants
+
+                fills_response = await connector._api_post(
+                    path_url=hl_constants.ACCOUNT_TRADE_LIST_URL,
+                    data={
+                        "type": hl_constants.TRADES_TYPE,
+                        "user": connector.hyperliquid_perpetual_address,
+                    },
+                )
+                by_oid: Dict[str, List[Dict[str, Any]]] = {}
+                for row in fills_response or []:
+                    oid = str(row.get("oid", ""))
+                    cloid = str(row.get("cloid") or "")
+                    if oid:
+                        by_oid.setdefault(oid, []).append(row)
+                    if cloid:
+                        by_oid.setdefault(cloid, []).append(row)
+                self._hl_fills_cache[cache_key] = (time.monotonic(), by_oid)
+                return by_oid
+            except Exception as exc:
+                logger.warning(
+                    "Could not load Hyperliquid fills for %s/%s: %s",
+                    account_name,
+                    connector_name,
+                    exc,
+                )
+                return {}
+
+    @staticmethod
+    def _fills_for_oid(fills_by_oid: Dict[str, List[Dict[str, Any]]], oid: str) -> List[Dict[str, Any]]:
+        if not oid:
+            return []
+        return fills_by_oid.get(str(oid), fills_by_oid.get(oid, []))
+
+    @staticmethod
+    def _compute_realized_pnl_from_hl_fills(
+        open_fills: List[Dict[str, Any]],
+        close_fills: List[Dict[str, Any]],
+        is_buy: bool,
+    ) -> Optional[tuple[Decimal, Decimal, Decimal]]:
+        """Return (net_pnl_quote, net_pnl_pct, filled_amount_quote) from HL userFills rows."""
+        if not open_fills or not close_fills:
+            return None
+
+        def _sum_fill_quote(fills: List[Dict[str, Any]]) -> Decimal:
+            total = Decimal("0")
+            for row in fills:
+                total += Decimal(str(row.get("px", 0))) * Decimal(str(row.get("sz", 0)))
+            return total
+
+        def _sum_fees(fills: List[Dict[str, Any]]) -> Decimal:
+            return sum(Decimal(str(row.get("fee", 0))) for row in fills)
+
+        open_quote = _sum_fill_quote(open_fills)
+        close_quote = _sum_fill_quote(close_fills)
+        fees = _sum_fees(open_fills) + _sum_fees(close_fills)
+        if open_quote <= 0 or close_quote <= 0:
+            return None
+
+        trade_pnl = (close_quote - open_quote) if is_buy else (open_quote - close_quote)
+        net_pnl = trade_pnl - fees
+        net_pnl_pct = net_pnl / open_quote if open_quote > 0 else Decimal("0")
+        filled_amount_quote = open_quote + close_quote
+        return net_pnl, net_pnl_pct, filled_amount_quote
+
+    async def _resolve_executor_fill_oids(
+        self,
+        record,
+        custom_info: Dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Resolve open/close exchange order ids for a terminated position executor."""
+        order_ids = custom_info.get("order_ids") or []
+        open_oid = str(order_ids[0]) if order_ids else None
+        close_oid = str(order_ids[1]) if len(order_ids) > 1 else None
+        if self._is_synthetic_order_id(open_oid):
+            open_oid = None
+        if self._is_synthetic_order_id(close_oid):
+            close_oid = None
+        if open_oid and close_oid:
+            return open_oid, close_oid
+
+        if not self.db_manager or not record.trading_pair:
+            return open_oid, close_oid
+
+        try:
+            config = json.loads(record.config) if record.config else {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        is_buy = not self._parse_config_side_is_short(config if isinstance(config, dict) else {})
+        open_side = "BUY" if is_buy else "SELL"
+        close_side = "SELL" if is_buy else "BUY"
+
+        try:
+            from database.repositories.order_repository import OrderRepository
+
+            async with self.db_manager.get_session_context() as session:
+                repo = OrderRepository(session)
+                orders = await repo.get_orders(
+                    account_name=record.account_name,
+                    connector_name=record.connector_name,
+                    trading_pair=record.trading_pair,
+                    status="FILLED",
+                    limit=100,
+                )
+        except Exception:
+            return open_oid, close_oid
+
+        created_at = record.created_at
+        closed_at = record.closed_at
+        candidates = []
+        for order in orders:
+            oid = str(order.client_order_id or "")
+            if not oid:
+                continue
+            if created_at and order.created_at and order.created_at < created_at:
+                continue
+            if closed_at and order.created_at and order.created_at > closed_at:
+                continue
+            candidates.append(order)
+
+        if not open_oid:
+            for order in candidates:
+                if (order.trade_type or "").upper() == open_side:
+                    open_oid = str(order.client_order_id)
+                    break
+
+        if not close_oid:
+            for order in reversed(candidates):
+                if (order.trade_type or "").upper() == close_side:
+                    if open_oid and str(order.client_order_id) == open_oid:
+                        continue
+                    close_oid = str(order.client_order_id)
+                    break
+
+        return open_oid, close_oid
+
+    async def _persist_repaired_executor_pnl(
+        self,
+        executor_id: str,
+        stored_pnl: Decimal,
+        net_pnl: Decimal,
+        net_pnl_pct: Decimal,
+        filled_quote: Decimal,
+        open_fills: List[Dict[str, Any]],
+        close_fills: List[Dict[str, Any]],
+        final_state_patch: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Write HL-fill repaired PnL back to the executor record when it differs."""
+        if not self.db_manager:
+            return False
+        if abs(stored_pnl - net_pnl) < Decimal("0.0001") and not final_state_patch:
+            return False
+
+        fees = sum(
+            Decimal(str(row.get("fee", 0)))
+            for row in (open_fills + close_fills)
+        )
+        try:
+            async with self.db_manager.get_session_context() as session:
+                repo = ExecutorRepository(session)
+                await repo.update_executor(
+                    executor_id=executor_id,
+                    net_pnl_quote=net_pnl,
+                    net_pnl_pct=net_pnl_pct,
+                    filled_amount_quote=filled_quote,
+                    cum_fees_quote=fees,
+                    final_state=json.dumps(final_state_patch, default=_json_default)
+                    if final_state_patch
+                    else None,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Could not persist repaired PnL for executor %s: %s",
+                executor_id,
+                exc,
+            )
+            return False
+
+        return True
+
+    async def _repair_executor_pnl_from_hl_fills(
+        self,
+        formatted: Dict[str, Any],
+        record,
+        fills_by_oid: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Correct persisted PnL using HL fill prices when order tracking recorded zero fills."""
+        if (
+            record.executor_type != "position_executor"
+            or record.status != "TERMINATED"
+            or not fills_by_oid
+        ):
+            return formatted
+
+        custom_info = formatted.get("custom_info") or {}
+        open_oid, close_oid = await self._resolve_executor_fill_oids(record, custom_info)
+        if not open_oid or not close_oid:
+            return formatted
+
+        try:
+            config = json.loads(record.config) if record.config else {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        is_buy = not self._parse_config_side_is_short(config if isinstance(config, dict) else {})
+
+        open_fills = self._fills_for_oid(fills_by_oid, open_oid)
+        close_fills = self._fills_for_oid(fills_by_oid, close_oid)
+        computed = self._compute_realized_pnl_from_hl_fills(
+            open_fills,
+            close_fills,
+            is_buy=is_buy,
+        )
+        if not computed:
+            return formatted
+
+        net_pnl, net_pnl_pct, filled_quote = computed
+        formatted["net_pnl_quote"] = float(net_pnl)
+        formatted["net_pnl_pct"] = float(net_pnl_pct)
+        formatted["filled_amount_quote"] = float(filled_quote)
+        stored_pnl = Decimal(str(record.net_pnl_quote or 0))
+        final_state_patch = None
+        order_ids = custom_info.get("order_ids") or []
+        if order_ids and self._is_synthetic_order_id(str(order_ids[0])):
+            final_state_patch = dict(custom_info)
+            final_state_patch["order_ids"] = [open_oid, close_oid]
+            formatted["custom_info"] = final_state_patch
+        if await self._persist_repaired_executor_pnl(
+            record.executor_id,
+            stored_pnl,
+            net_pnl,
+            net_pnl_pct,
+            filled_quote,
+            open_fills,
+            close_fills,
+            final_state_patch=final_state_patch,
+        ):
+            record.net_pnl_quote = net_pnl
+            record.net_pnl_pct = net_pnl_pct
+            record.filled_amount_quote = filled_quote
+            if final_state_patch:
+                record.final_state = json.dumps(final_state_patch, default=_json_default)
+        return formatted
+
+    async def _refresh_position_executor_orders_before_persist(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> None:
+        """Refresh tracked orders from connector and HL fills before persisting PnL."""
+        from hummingbot.core.data_type.in_flight_order import OrderState
+
+        if not isinstance(executor, PositionExecutor):
+            return
+
+        config = executor.config
+        connector_name = config.connector_name
+        if "hyperliquid" not in connector_name:
+            return
+
+        connector = await self._get_trading_interface(account_name).ensure_connector(
+            connector_name
+        )
+        for attr in ("_open_order", "_close_order", "_take_profit_limit_order"):
+            tracked = getattr(executor, attr, None)
+            if not tracked or not tracked.order_id:
+                continue
+            live = connector.in_flight_orders.get(tracked.order_id)
+            if live:
+                tracked.order = live
+
+        fills_by_oid = await self._load_hyperliquid_fills_by_oid(account_name, connector_name)
+        open_oid = (
+            str(executor._open_order.order.exchange_order_id)
+            if executor._open_order and executor._open_order.order and executor._open_order.order.exchange_order_id
+            else (executor._open_order.order_id if executor._open_order else None)
+        )
+        close_oid = (
+            str(executor._close_order.order.exchange_order_id)
+            if executor._close_order and executor._close_order.order and executor._close_order.order.exchange_order_id
+            else (executor._close_order.order_id if executor._close_order else None)
+        )
+        if not open_oid and executor._open_order:
+            open_oid = executor._open_order.order_id
+        if not close_oid and executor._close_order:
+            close_oid = executor._close_order.order_id
+
+        for tracked, oid in (
+            (executor._open_order, open_oid),
+            (executor._close_order, close_oid),
+        ):
+            if not tracked or not oid:
+                continue
+            fills = self._fills_for_oid(fills_by_oid, oid)
+            if not fills or not tracked.order:
+                continue
+            base = sum(Decimal(str(f.get("sz", 0))) for f in fills)
+            quote = sum(Decimal(str(f.get("px", 0))) * Decimal(str(f.get("sz", 0))) for f in fills)
+            if base <= 0:
+                continue
+            tracked.order.executed_amount_base = base
+            tracked.order.executed_amount_quote = quote
+            tracked.order.current_state = OrderState.FILLED
+            tracked.order.completely_filled_event.set()
 
     @staticmethod
     def _mark_position_executor_recovered(executor: ExecutorBase) -> None:
@@ -755,7 +1593,7 @@ class ExecutorService:
             config = {}
 
         try:
-            positions = await self._trading_service.get_positions(
+            positions = await self._resolve_positions(
                 record.account_name, record.connector_name
             )
         except Exception as exc:
@@ -832,6 +1670,14 @@ class ExecutorService:
         """Stop the executor service and all active executors."""
         self._is_running = False
 
+        if self._recovery_task and not self._recovery_task.done():
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+            self._recovery_task = None
+
         if self._control_loop_task:
             self._control_loop_task.cancel()
             try:
@@ -867,10 +1713,43 @@ class ExecutorService:
                 # Update timestamps for all trading interfaces via TradingService
                 self._trading_service.update_all_timestamps()
 
+                # Backfill open-order fill amounts when exchange position exists but
+                # connector fill tracking left executed_amount_base at zero.
+                # Defer while background startup recovery is running to avoid
+                # competing HL position polls against the batched recovery pass.
+                if not self._recovery_in_progress:
+                    for executor_id, executor in list(self._active_executors.items()):
+                        if executor.is_closed:
+                            continue
+                        metadata = self._executor_metadata.get(executor_id, {})
+                        executor_type = metadata.get("executor_type")
+                        account_name = metadata.get("account_name") or self.default_account
+
+                        from hummingbot.strategy_v2.models.base import RunnableStatus
+
+                        if executor.status == RunnableStatus.SHUTTING_DOWN:
+                            if executor_type in ("position_executor", "order_executor"):
+                                await self._assist_executor_shutdown(executor, account_name)
+                            continue
+
+                        if executor_type == "position_executor":
+                            await self._reconcile_position_executor_stale_open_order(
+                                executor, account_name
+                            )
+                            await self._sync_position_executor_open_fill_from_exchange(
+                                executor, account_name
+                            )
+                        elif executor_type == "order_executor":
+                            await self._reconcile_order_executor_stale_order(
+                                executor, account_name
+                            )
+
                 # Check for completed executors
                 completed_ids = []
                 for executor_id, executor in self._active_executors.items():
                     if executor.is_closed:
+                        if executor_id in self._executors_pending_creation_persist:
+                            continue
                         completed_ids.append(executor_id)
 
                 # Handle completed executors
@@ -1020,6 +1899,8 @@ class ExecutorService:
         connector_name = executor_config.get("connector_name")
         trading_pair = executor_config.get("trading_pair")
         await self._prepare_market(account, connector_name, trading_pair)
+        if executor_type == "position_executor":
+            await self._validate_position_executor_order_size(account, executor_config)
 
         # Instantiate the executor, register it in memory and start it
         controller_id = controller_id or getattr(typed_config, "controller_id", "main") or "main"
@@ -1034,8 +1915,15 @@ class ExecutorService:
         }
         executor_id, executor = self._instantiate_and_register(executor_class, typed_config, trading_interface, metadata)
 
-        # Persist to database
-        await self._persist_executor_created(executor_id, executor)
+        self._executors_pending_creation_persist.add(executor_id)
+        try:
+            if executor_type == "position_executor" and not executor.is_closed:
+                await self._sync_position_executor_open_fill_from_exchange(executor, account)
+
+            # Persist to database before completion handling so metadata cannot be cleared first.
+            await self._persist_executor_created(executor_id, executor, metadata)
+        finally:
+            self._executors_pending_creation_persist.discard(executor_id)
 
         # Capture created_at before potential cleanup
         created_at = metadata["created_at"].isoformat()
@@ -1121,6 +2009,17 @@ class ExecutorService:
                         limit=limit
                     )
 
+                    repair_candidates = [
+                        r for r in db_executors if self._executor_may_need_hl_pnl_repair(r)
+                    ]
+                    fills_by_oid: Dict[str, List[Dict[str, Any]]] = {}
+                    if repair_candidates:
+                        repair_account = account_name or self.default_account
+                        repair_connector = connector_name or "hyperliquid_perpetual"
+                        fills_by_oid = await self._load_hyperliquid_fills_by_oid(
+                            repair_account, repair_connector
+                        )
+
                     for record in db_executors:
                         # Skip if already in active executors (safety check)
                         if record.executor_id in self._active_executors:
@@ -1128,7 +2027,12 @@ class ExecutorService:
                         # Stale RUNNING rows left in DB must not appear as live executors.
                         if record.status == "RUNNING":
                             continue
-                        result.append(self._format_db_record(record))
+                        formatted = self._format_db_record(record)
+                        if fills_by_oid and self._executor_may_need_hl_pnl_repair(record):
+                            formatted = await self._repair_executor_pnl_from_hl_fills(
+                                formatted, record, fills_by_oid
+                            )
+                        result.append(formatted)
             except Exception as e:
                 logger.error(f"Error fetching executors from database: {e}")
 
@@ -1159,7 +2063,17 @@ class ExecutorService:
 
                     record = await repo.get_executor_by_id(executor_id)
                     if record:
-                        return self._format_db_record(record)
+                        formatted = self._format_db_record(record)
+                        if self._executor_may_need_hl_pnl_repair(record):
+                            fills_by_oid = await self._load_hyperliquid_fills_by_oid(
+                                record.account_name or self.default_account,
+                                record.connector_name,
+                            )
+                            if fills_by_oid:
+                                formatted = await self._repair_executor_pnl_from_hl_fills(
+                                    formatted, record, fills_by_oid
+                                )
+                        return formatted
             except Exception as e:
                 logger.error(f"Error fetching executor from database: {e}")
 
@@ -1233,6 +2147,10 @@ class ExecutorService:
             return
 
         metadata = self._executor_metadata.get(executor_id, {})
+
+        # Refresh HL fill data before reading PnL for position executors.
+        account_name = metadata.get("account_name") or self.default_account
+        await self._refresh_position_executor_orders_before_persist(executor, account_name)
 
         # Check if this is a POSITION_HOLD close type (keep_position=True)
         if executor.close_type == CloseType.POSITION_HOLD:
@@ -1516,23 +2434,38 @@ class ExecutorService:
 
         return report
 
-    async def _persist_executor_created(self, executor_id: str, executor: ExecutorBase):
+    async def _persist_executor_created(
+        self,
+        executor_id: str,
+        executor: ExecutorBase,
+        metadata: Dict[str, Any],
+    ):
         """Persist executor creation to database."""
         if not self.db_manager:
             return
 
-        try:
-            metadata = self._executor_metadata.get(executor_id, {})
+        executor_type = metadata.get("executor_type")
+        account_name = metadata.get("account_name")
+        connector_name = metadata.get("connector_name")
+        trading_pair = metadata.get("trading_pair")
+        if not all([executor_type, account_name, connector_name, trading_pair]):
+            logger.error(
+                "Cannot persist executor %s creation: incomplete metadata %s",
+                executor_id,
+                metadata,
+            )
+            return
 
+        try:
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
 
                 await repo.create_executor(
                     executor_id=executor_id,
-                    executor_type=metadata.get("executor_type"),
-                    account_name=metadata.get("account_name"),
-                    connector_name=metadata.get("connector_name"),
-                    trading_pair=metadata.get("trading_pair"),
+                    executor_type=executor_type,
+                    account_name=account_name,
+                    connector_name=connector_name,
+                    trading_pair=trading_pair,
                     config=json.dumps(metadata.get("config", {}), default=_json_default),
                     status=executor.status.name,
                     controller_id=metadata.get("controller_id", "main")
@@ -1615,7 +2548,7 @@ class ExecutorService:
             async with self.db_manager.get_session_context() as session:
                 repo = ExecutorRepository(session)
 
-                await repo.update_executor(
+                updated = await repo.update_executor(
                     executor_id=executor_id,
                     status=status_name,
                     close_type=close_type,
@@ -1626,6 +2559,39 @@ class ExecutorService:
                     final_state=final_state_json,
                     error_log=error_log_json
                 )
+                if updated is None and metadata:
+                    upsert_type = metadata.get("executor_type")
+                    upsert_account = metadata.get("account_name")
+                    upsert_connector = metadata.get("connector_name")
+                    upsert_pair = metadata.get("trading_pair")
+                    if all([upsert_type, upsert_account, upsert_connector, upsert_pair]):
+                        await repo.create_executor(
+                            executor_id=executor_id,
+                            executor_type=upsert_type,
+                            account_name=upsert_account,
+                            connector_name=upsert_connector,
+                            trading_pair=upsert_pair,
+                            config=json.dumps(metadata.get("config", {}), default=_json_default),
+                            status=status_name,
+                            controller_id=metadata.get("controller_id", "main"),
+                        )
+                        await repo.update_executor(
+                            executor_id=executor_id,
+                            status=status_name,
+                            close_type=close_type,
+                            net_pnl_quote=net_pnl_quote,
+                            net_pnl_pct=net_pnl_pct,
+                            cum_fees_quote=cum_fees_quote,
+                            filled_amount_quote=filled_amount_quote,
+                            final_state=final_state_json,
+                            error_log=error_log_json
+                        )
+                    else:
+                        logger.error(
+                            "Cannot upsert completed executor %s: incomplete metadata %s",
+                            executor_id,
+                            metadata,
+                        )
 
             logger.debug(f"Persisted executor {executor_id} completion to database")
 

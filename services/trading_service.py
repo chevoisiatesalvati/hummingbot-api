@@ -545,8 +545,12 @@ class TradingService:
 
     def update_all_timestamps(self):
         """Update timestamps for all trading interfaces. Called by executor control loop."""
+        now = time.time()
         for interface in self._trading_interfaces.values():
-            interface.update_timestamp()
+            interface._current_timestamp = now
+        for account_connectors in self._connector_service._trading_connectors.values():
+            for connector in account_connectors.values():
+                connector._set_current_timestamp(now)
 
     # ==================== Properties ====================
 

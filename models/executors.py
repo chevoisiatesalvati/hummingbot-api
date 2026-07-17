@@ -489,3 +489,45 @@ class ExecutorLogsResponse(BaseModel):
     executor_id: str = Field(description="Executor identifier")
     logs: List[ExecutorLogEntry] = Field(description="Log entries")
     total_count: int = Field(description="Total number of log entries (before limit)")
+
+
+class RepairHlPnlRequest(BaseModel):
+    """Bulk Hyperliquid fill-based PnL repair (dry-run by default)."""
+
+    dry_run: bool = Field(
+        default=True,
+        description="When true (default), compute and compare only — no DB writes",
+    )
+    force: bool = Field(
+        default=False,
+        description="When applying, allow updates even if proposed PnL diverges from HL",
+    )
+    account_name: Optional[str] = Field(
+        default=None,
+        description="Account to repair (defaults to server default account)",
+    )
+    connector_name: Optional[str] = Field(
+        default="hyperliquid_perpetual",
+        description="Hyperliquid connector name",
+    )
+    trading_pair: Optional[str] = Field(
+        default=None,
+        description="Optional trading-pair filter",
+    )
+    controller_id: Optional[str] = Field(
+        default=None,
+        description="Optional controller_id filter",
+    )
+
+
+class RepairHlPnlResponse(BaseModel):
+    """Dry-run / apply report for HL PnL repair."""
+
+    dry_run: bool
+    force: bool
+    summary: Dict[str, Any]
+    diverging: List[Dict[str, Any]] = Field(default_factory=list)
+    rows: List[Dict[str, Any]] = Field(default_factory=list)
+    error: Optional[str] = None
+
+    model_config = ConfigDict(extra="allow")

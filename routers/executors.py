@@ -21,6 +21,8 @@ from models.executors import (
     PerformanceReportResponse,
     PositionHoldResponse,
     PositionsSummaryResponse,
+    RepairHlPnlRequest,
+    RepairHlPnlResponse,
     StopExecutorRequest,
     StopExecutorResponse,
 )
@@ -153,6 +155,39 @@ async def list_executors(
     except Exception as e:
         logger.error(f"Error listing executors: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error listing executors: {str(e)}")
+
+
+@router.post("/repair-hl-pnl", response_model=RepairHlPnlResponse)
+async def repair_hl_pnl(
+    request: RepairHlPnlRequest,
+    executor_service: ExecutorService = Depends(get_executor_service),
+):
+    """
+    Recalculate terminated Hyperliquid position-executor PnL from userFills.
+
+    **dry_run=true (default):** no DB writes. Returns per-executor stored vs proposed
+    vs HL ground-truth fields so you can review before applying.
+
+    **dry_run=false:** persist updates. Refuses if any would-update row has
+    ``match_hl=false`` unless ``force=true``.
+
+    Skips ``STALE_DUPLICATE`` / ``MISTAKE`` / ``MANUAL`` close types.
+    """
+    try:
+        result = await executor_service.repair_hl_executor_pnl_bulk(
+            dry_run=request.dry_run,
+            force=request.force,
+            account_name=request.account_name,
+            connector_name=request.connector_name or "hyperliquid_perpetual",
+            trading_pair=request.trading_pair,
+            controller_id=request.controller_id,
+        )
+        return RepairHlPnlResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error repairing HL PnL: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error repairing HL PnL: {str(e)}")
 
 
 @router.get("/summary", response_model=ExecutorsSummaryResponse)

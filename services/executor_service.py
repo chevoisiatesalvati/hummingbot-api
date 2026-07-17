@@ -181,6 +181,7 @@ class ExecutorService:
         self._hl_fills_cache: Dict[tuple[str, str], tuple[float, Dict[str, List[Dict[str, Any]]]]] = {}
         self._hl_fills_cache_ttl_seconds = 300.0
         self._hl_fills_fetch_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        self._hl_fills_last_error: Optional[str] = None
 
     def schedule_startup_recovery(self) -> None:
         """Kick off DB executor recovery in the background (non-blocking startup)."""
@@ -1067,15 +1068,49 @@ class ExecutorService:
             return None
         return connector_service.get_account_connectors(account_name).get(connector_name)
 
+    async def _ensure_hyperliquid_connector(
+        self,
+        account_name: str,
+        connector_name: str,
+    ):
+        """Return HL connector, initializing credentials/session when needed."""
+        connector = self._get_initialized_hyperliquid_connector(account_name, connector_name)
+        if connector is not None:
+            return connector
+        try:
+            return await self._get_trading_interface(account_name).ensure_connector(
+                connector_name
+            )
+        except Exception as exc:
+            self._hl_fills_last_error = f"ensure_connector failed: {exc}"
+            logger.warning(
+                "Could not initialize Hyperliquid connector for %s/%s: %s",
+                account_name,
+                connector_name,
+                exc,
+            )
+            return None
+
     async def _load_hyperliquid_fills_by_oid(
         self,
         account_name: str,
         connector_name: str,
+        *,
+        ensure_init: bool = True,
+        allow_during_recovery: bool = False,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Fetch HL userFills once and index by exchange order id."""
+        """Fetch HL userFills once and index by exchange / client order id.
+
+        On failure, sets ``self._hl_fills_last_error`` for bulk-repair diagnostics.
+        """
+        self._hl_fills_last_error = None
         if "hyperliquid" not in connector_name:
+            self._hl_fills_last_error = "not a hyperliquid connector"
             return {}
-        if self._recovery_in_progress:
+        # Opportunistic get/search skips during recovery to avoid 429; bulk repair
+        # must still be able to load fills (caller passes allow_during_recovery=True).
+        if self._recovery_in_progress and not allow_during_recovery:
+            self._hl_fills_last_error = "recovery_in_progress"
             return {}
 
         cache_key = (account_name, connector_name)
@@ -1091,23 +1126,34 @@ class ExecutorService:
             if cached and (time.monotonic() - cached[0]) < self._hl_fills_cache_ttl_seconds:
                 return cached[1]
 
-            connector = self._get_initialized_hyperliquid_connector(account_name, connector_name)
-            if connector is None:
-                logger.debug(
-                    "Skipping HL fills fetch for %s/%s: connector not initialized",
-                    account_name,
-                    connector_name,
+            if ensure_init:
+                connector = await self._ensure_hyperliquid_connector(
+                    account_name, connector_name
                 )
+            else:
+                connector = self._get_initialized_hyperliquid_connector(
+                    account_name, connector_name
+                )
+            if connector is None:
+                self._hl_fills_last_error = (
+                    f"connector not available for {account_name}/{connector_name}"
+                )
+                logger.warning("Skipping HL fills fetch: %s", self._hl_fills_last_error)
                 return {}
 
             try:
                 from hummingbot.connector.derivative.hyperliquid_perpetual import hyperliquid_perpetual_constants as hl_constants
 
+                user_address = getattr(connector, "hyperliquid_perpetual_address", None)
+                if not user_address:
+                    self._hl_fills_last_error = "connector missing hyperliquid_perpetual_address"
+                    return {}
+
                 fills_response = await connector._api_post(
                     path_url=hl_constants.ACCOUNT_TRADE_LIST_URL,
                     data={
                         "type": hl_constants.TRADES_TYPE,
-                        "user": connector.hyperliquid_perpetual_address,
+                        "user": user_address,
                     },
                 )
                 by_oid: Dict[str, List[Dict[str, Any]]] = {}
@@ -1119,8 +1165,10 @@ class ExecutorService:
                     if cloid:
                         by_oid.setdefault(cloid, []).append(row)
                 self._hl_fills_cache[cache_key] = (time.monotonic(), by_oid)
+                self._hl_fills_last_error = None
                 return by_oid
             except Exception as exc:
+                self._hl_fills_last_error = str(exc)
                 logger.warning(
                     "Could not load Hyperliquid fills for %s/%s: %s",
                     account_name,
@@ -1175,35 +1223,163 @@ class ExecutorService:
         return quote / base
 
     @staticmethod
+    def _base_from_hl_fills(fills: List[Dict[str, Any]]) -> Decimal:
+        total = Decimal("0")
+        for row in fills:
+            sz = Decimal(str(row.get("sz", 0)))
+            if sz > 0:
+                total += sz
+        return total
+
+    @staticmethod
+    def _quote_from_hl_fills(fills: List[Dict[str, Any]]) -> Decimal:
+        total = Decimal("0")
+        for row in fills:
+            sz = Decimal(str(row.get("sz", 0)))
+            px = Decimal(str(row.get("px", 0)))
+            if sz > 0 and px > 0:
+                total += px * sz
+        return total
+
+    @staticmethod
+    def _fees_from_hl_fills(fills: List[Dict[str, Any]]) -> Decimal:
+        return sum((Decimal(str(row.get("fee", 0))) for row in fills), Decimal("0"))
+
+    @staticmethod
+    def _closed_pnl_from_hl_fills(fills: List[Dict[str, Any]]) -> Decimal:
+        """Sum HL closedPnl on fill rows (pre-fee realized on closing fills)."""
+        return sum(
+            (Decimal(str(row.get("closedPnl", 0))) for row in fills),
+            Decimal("0"),
+        )
+
+    @classmethod
+    def _hl_fills_have_closed_pnl_field(cls, fills: List[Dict[str, Any]]) -> bool:
+        return any("closedPnl" in row for row in fills)
+
+    @classmethod
+    def _size_mismatch_from_hl_fills(
+        cls,
+        open_fills: List[Dict[str, Any]],
+        close_fills: List[Dict[str, Any]],
+        *,
+        rel_tol: Decimal = Decimal("0.01"),
+    ) -> bool:
+        open_base = cls._base_from_hl_fills(open_fills)
+        close_base = cls._base_from_hl_fills(close_fills)
+        if open_base <= 0 or close_base <= 0:
+            return False
+        ratio = abs(open_base - close_base) / max(open_base, close_base)
+        return ratio > rel_tol
+
+    @classmethod
     def _compute_realized_pnl_from_hl_fills(
+        cls,
         open_fills: List[Dict[str, Any]],
         close_fills: List[Dict[str, Any]],
         is_buy: bool,
     ) -> Optional[tuple[Decimal, Decimal, Decimal]]:
-        """Return (net_pnl_quote, net_pnl_pct, filled_amount_quote) from HL userFills rows."""
+        """Return (net_pnl_quote, net_pnl_pct, filled_amount_quote) from HL userFills.
+
+        Prefer sum(closedPnl) on **close** fills minus open+close fees (HL closedPnl is
+        pre-fee). Never use open-leg closedPnl (flip opens realize a prior position).
+
+        Fallback when closedPnl is absent: matched-base VWAP so unequal open/close
+        sizes cannot invent phantom PnL from quote notional mismatch.
+        """
+        breakdown = cls._hl_pnl_breakdown_from_fills(open_fills, close_fills, is_buy)
+        if breakdown is None:
+            return None
+        return (
+            breakdown["proposed_pnl"],
+            breakdown["proposed_pct"],
+            breakdown["proposed_filled_quote"],
+        )
+
+    @classmethod
+    def _hl_pnl_breakdown_from_fills(
+        cls,
+        open_fills: List[Dict[str, Any]],
+        close_fills: List[Dict[str, Any]],
+        is_buy: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Compute proposed PnL plus HL ground-truth fields for dry-run comparison."""
         if not open_fills or not close_fills:
             return None
 
-        def _sum_fill_quote(fills: List[Dict[str, Any]]) -> Decimal:
-            total = Decimal("0")
-            for row in fills:
-                total += Decimal(str(row.get("px", 0))) * Decimal(str(row.get("sz", 0)))
-            return total
+        open_base = cls._base_from_hl_fills(open_fills)
+        close_base = cls._base_from_hl_fills(close_fills)
+        open_quote = cls._quote_from_hl_fills(open_fills)
+        close_quote = cls._quote_from_hl_fills(close_fills)
+        fees_open = cls._fees_from_hl_fills(open_fills)
+        fees_close = cls._fees_from_hl_fills(close_fills)
+        fees_total = fees_open + fees_close
+        open_vwap = cls._vwap_from_hl_fills(open_fills)
+        close_vwap = cls._vwap_from_hl_fills(close_fills)
+        size_mismatch = cls._size_mismatch_from_hl_fills(open_fills, close_fills)
 
-        def _sum_fees(fills: List[Dict[str, Any]]) -> Decimal:
-            return sum(Decimal(str(row.get("fee", 0))) for row in fills)
-
-        open_quote = _sum_fill_quote(open_fills)
-        close_quote = _sum_fill_quote(close_fills)
-        fees = _sum_fees(open_fills) + _sum_fees(close_fills)
-        if open_quote <= 0 or close_quote <= 0:
+        if close_base <= 0 or open_base <= 0 or open_quote <= 0 or close_quote <= 0:
             return None
 
-        trade_pnl = (close_quote - open_quote) if is_buy else (open_quote - close_quote)
-        net_pnl = trade_pnl - fees
-        net_pnl_pct = net_pnl / open_quote if open_quote > 0 else Decimal("0")
-        filled_amount_quote = open_quote + close_quote
-        return net_pnl, net_pnl_pct, filled_amount_quote
+        hl_closed_pnl = cls._closed_pnl_from_hl_fills(close_fills)
+        use_closed_pnl = cls._hl_fills_have_closed_pnl_field(close_fills)
+
+        matched_base = min(open_base, close_base)
+        if open_vwap is None or close_vwap is None:
+            return None
+
+        if use_closed_pnl:
+            # SQD / HL fill tape: closedPnl is pre-fee realized on the close.
+            # Never include open-leg closedPnl (flip opens realize a prior position).
+            trade_pnl = hl_closed_pnl
+            method = "closed_pnl"
+            # Flip/partial opens: open fill fees cover closing another position too.
+            # Attribute only close-leg fees so net matches HL UI for the close.
+            if size_mismatch:
+                fees_for_net = fees_close
+            else:
+                fees_for_net = fees_total
+        else:
+            trade_pnl = (
+                (close_vwap - open_vwap) * matched_base
+                if is_buy
+                else (open_vwap - close_vwap) * matched_base
+            )
+            method = "matched_vwap"
+            fees_for_net = fees_total
+
+        net_pnl = trade_pnl - fees_for_net
+        # Percent on residual/matched close notional (correct for flips).
+        pct_den = close_vwap * matched_base
+        net_pnl_pct = net_pnl / pct_den if pct_den > 0 else Decimal("0")
+        # Round-trip quote volume uses matched open notional + close notional.
+        matched_open_quote = open_vwap * matched_base
+        filled_amount_quote = matched_open_quote + close_quote
+
+        # HL comparison target uses the same formula we would persist.
+        hl_net_pnl = net_pnl
+
+        return {
+            "proposed_pnl": net_pnl,
+            "proposed_pct": net_pnl_pct,
+            "proposed_filled_quote": filled_amount_quote,
+            "proposed_fees": fees_for_net,
+            "proposed_close": close_vwap,
+            "proposed_entry": (
+                # Flip opens have misleading VWAP; keep entry unset for caller to preserve.
+                None if size_mismatch else open_vwap
+            ),
+            "hl_closed_pnl": hl_closed_pnl,
+            "hl_fees_open": fees_open,
+            "hl_fees_close": fees_close,
+            "hl_fees_total": fees_total,
+            "hl_net_pnl": hl_net_pnl,
+            "open_base": open_base,
+            "close_base": close_base,
+            "matched_base": matched_base,
+            "size_mismatch": size_mismatch,
+            "method": method,
+        }
 
     async def _resolve_executor_fill_oids(
         self,
@@ -1365,21 +1541,21 @@ class ExecutorService:
 
         open_fills = self._fills_for_oids(fills_by_oid, *open_keys)
         close_fills = self._fills_for_oids(fills_by_oid, *close_keys)
-        computed = self._compute_realized_pnl_from_hl_fills(
+        breakdown = self._hl_pnl_breakdown_from_fills(
             open_fills,
             close_fills,
             is_buy=is_buy,
         )
-        if not computed:
+        if not breakdown:
             return formatted
 
-        net_pnl, net_pnl_pct, filled_quote = computed
+        net_pnl = breakdown["proposed_pnl"]
+        net_pnl_pct = breakdown["proposed_pct"]
+        filled_quote = breakdown["proposed_filled_quote"]
+        fees = breakdown["proposed_fees"]
         formatted["net_pnl_quote"] = float(net_pnl)
         formatted["net_pnl_pct"] = float(net_pnl_pct)
         formatted["filled_amount_quote"] = float(filled_quote)
-        fees = sum(
-            Decimal(str(row.get("fee", 0))) for row in (open_fills + close_fills)
-        )
         formatted["cum_fees_quote"] = float(fees)
 
         stored_pnl = Decimal(str(record.net_pnl_quote or 0))
@@ -1387,10 +1563,10 @@ class ExecutorService:
         order_ids = custom_info.get("order_ids") or []
         if order_ids and self._is_synthetic_order_id(str(order_ids[0])):
             final_state_patch["order_ids"] = [open_oid, close_oid]
-        open_vwap = self._vwap_from_hl_fills(open_fills)
-        close_vwap = self._vwap_from_hl_fills(close_fills)
-        if open_vwap is not None:
-            final_state_patch["current_position_average_price"] = float(open_vwap)
+        close_vwap = breakdown["proposed_close"]
+        entry_vwap = breakdown["proposed_entry"]
+        if entry_vwap is not None:
+            final_state_patch["current_position_average_price"] = float(entry_vwap)
         if close_vwap is not None:
             final_state_patch["close_price"] = float(close_vwap)
         formatted["custom_info"] = final_state_patch
@@ -1411,6 +1587,354 @@ class ExecutorService:
             record.cum_fees_quote = fees
             record.final_state = json.dumps(final_state_patch, default=_json_default)
         return formatted
+
+    _HL_PNL_REPAIR_SKIP_CLOSE_TYPES = frozenset({"STALE_DUPLICATE", "MISTAKE", "MANUAL"})
+    _HL_PNL_MATCH_EPSILON = Decimal("0.05")
+    _HL_PNL_UPDATE_EPSILON = Decimal("0.0001")
+
+    async def repair_hl_executor_pnl_bulk(
+        self,
+        *,
+        dry_run: bool = True,
+        force: bool = False,
+        account_name: Optional[str] = None,
+        connector_name: Optional[str] = None,
+        trading_pair: Optional[str] = None,
+        controller_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Compare / repair terminated HL position-executor PnL from userFills.
+
+        dry_run=True (default): no DB writes; returns stored vs proposed vs HL fields.
+        dry_run=False: persist updates. Refuses if any would_update row has match_hl=False
+        unless force=True.
+        """
+        account = account_name or self.default_account
+        connector = connector_name or "hyperliquid_perpetual"
+        if "hyperliquid" not in connector:
+            return {
+                "dry_run": dry_run,
+                "force": force,
+                "examined": 0,
+                "error": "connector_name must be a hyperliquid connector",
+                "rows": [],
+                "summary": {},
+            }
+
+        if not self.db_manager:
+            return {
+                "dry_run": dry_run,
+                "force": force,
+                "examined": 0,
+                "error": "database not available",
+                "rows": [],
+                "summary": {},
+            }
+
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            records = await repo.get_executors(
+                account_name=account,
+                connector_name=connector,
+                trading_pair=trading_pair,
+                executor_type="position_executor",
+                status="TERMINATED",
+                controller_id=controller_id,
+                limit=None,
+            )
+
+        fills_by_oid = await self._load_hyperliquid_fills_by_oid(
+            account,
+            connector,
+            ensure_init=True,
+            allow_during_recovery=True,
+        )
+        fills_error = getattr(self, "_hl_fills_last_error", None)
+
+        rows: List[Dict[str, Any]] = []
+        for record in records:
+            close_type = str(record.close_type or "")
+            if close_type in self._HL_PNL_REPAIR_SKIP_CLOSE_TYPES:
+                rows.append(
+                    self._hl_pnl_repair_row_stub(
+                        record, status="skipped_close_type", fills_available=bool(fills_by_oid)
+                    )
+                )
+                continue
+            try:
+                row = await self._build_hl_pnl_repair_row(record, fills_by_oid)
+            except Exception as exc:
+                logger.warning(
+                    "HL PnL repair row failed for %s: %s", record.executor_id, exc
+                )
+                rows.append(
+                    self._hl_pnl_repair_row_stub(
+                        record, status="error", error=str(exc), fills_available=bool(fills_by_oid)
+                    )
+                )
+                continue
+            rows.append(row)
+
+        would_update = [r for r in rows if r.get("status") == "would_update"]
+        diverging = [r for r in would_update if not r.get("match_hl")]
+        matching = [r for r in would_update if r.get("match_hl")]
+        stale_rows = [r for r in rows if r.get("status") == "skipped_close_type"]
+        stale_nonzero = [
+            r
+            for r in stale_rows
+            if abs(float(r.get("stored_pnl") or 0)) >= float(self._HL_PNL_UPDATE_EPSILON)
+            or abs(float(r.get("stored_fees") or 0)) >= float(self._HL_PNL_UPDATE_EPSILON)
+        ]
+
+        summary = {
+            "examined": len(rows),
+            "would_update": len(would_update),
+            "unchanged": sum(1 for r in rows if r.get("status") == "unchanged"),
+            "skipped": sum(1 for r in rows if str(r.get("status", "")).startswith("skipped")),
+            "errors": sum(1 for r in rows if r.get("status") == "error"),
+            "would_update_matching_hl": len(matching),
+            "would_update_diverging_hl": len(diverging),
+            "would_zero_stale": len(stale_nonzero),
+            "applied": 0,
+            "stale_zeroed": 0,
+            "refused": False,
+            "fills_loaded": len(fills_by_oid),
+            "fills_error": fills_error,
+        }
+
+        # Surface divergences first for dry-run review.
+        rows.sort(
+            key=lambda r: (
+                0 if r.get("status") == "would_update" and not r.get("match_hl") else
+                1 if r.get("status") == "would_update" else
+                2 if r.get("status") == "error" else
+                3
+            )
+        )
+
+        if not dry_run:
+            if diverging and not force:
+                summary["refused"] = True
+                summary["refuse_reason"] = (
+                    f"{len(diverging)} would_update row(s) diverge from HL "
+                    "(match_hl=false); pass force=true to apply anyway"
+                )
+                return {
+                    "dry_run": dry_run,
+                    "force": force,
+                    "summary": summary,
+                    "diverging": diverging,
+                    "rows": rows,
+                }
+
+            applied = 0
+            for record in records:
+                row = next(
+                    (r for r in rows if r.get("executor_id") == record.executor_id),
+                    None,
+                )
+                if not row or row.get("status") != "would_update":
+                    continue
+                if not row.get("match_hl") and not force:
+                    continue
+                formatted = self._format_db_record(record)
+                updated = await self._repair_executor_pnl_from_hl_fills(
+                    formatted, record, fills_by_oid
+                )
+                if abs(
+                    Decimal(str(updated.get("net_pnl_quote") or 0))
+                    - Decimal(str(row.get("stored_pnl") or 0))
+                ) >= self._HL_PNL_UPDATE_EPSILON:
+                    applied += 1
+                    row["status"] = "updated"
+                    row["applied_pnl"] = updated.get("net_pnl_quote")
+            summary["applied"] = applied
+
+            # Zero junk close types so Condor / Executors KPIs are not polluted.
+            stale_zeroed = await self._zero_excluded_close_type_pnls(
+                account=account,
+                connector=connector,
+                trading_pair=trading_pair,
+                controller_id=controller_id,
+            )
+            summary["stale_zeroed"] = stale_zeroed
+            for row in stale_nonzero:
+                row["status"] = "stale_zeroed"
+                row["proposed_pnl"] = 0.0
+                row["proposed_fees"] = 0.0
+
+        return {
+            "dry_run": dry_run,
+            "force": force,
+            "summary": summary,
+            "diverging": diverging,
+            "stale_nonzero": stale_nonzero,
+            "rows": rows,
+        }
+
+    async def _zero_excluded_close_type_pnls(
+        self,
+        *,
+        account: str,
+        connector: str,
+        trading_pair: Optional[str] = None,
+        controller_id: Optional[str] = None,
+    ) -> int:
+        """Set net PnL/fees to 0 for STALE_DUPLICATE / MISTAKE / MANUAL rows."""
+        if not self.db_manager:
+            return 0
+        zeroed = 0
+        async with self.db_manager.get_session_context() as session:
+            repo = ExecutorRepository(session)
+            records = await repo.get_executors(
+                account_name=account,
+                connector_name=connector,
+                trading_pair=trading_pair,
+                executor_type="position_executor",
+                status="TERMINATED",
+                controller_id=controller_id,
+                limit=None,
+            )
+            for record in records:
+                if str(record.close_type or "") not in self._HL_PNL_REPAIR_SKIP_CLOSE_TYPES:
+                    continue
+                stored = Decimal(str(record.net_pnl_quote or 0))
+                fees = Decimal(str(record.cum_fees_quote or 0))
+                if (
+                    abs(stored) < self._HL_PNL_UPDATE_EPSILON
+                    and abs(fees) < self._HL_PNL_UPDATE_EPSILON
+                ):
+                    continue
+                try:
+                    await repo.update_executor(
+                        executor_id=record.executor_id,
+                        net_pnl_quote=Decimal("0"),
+                        net_pnl_pct=Decimal("0"),
+                        cum_fees_quote=Decimal("0"),
+                    )
+                    zeroed += 1
+                except Exception as exc:
+                    logger.warning(
+                        "Could not zero excluded close_type PnL for %s: %s",
+                        record.executor_id,
+                        exc,
+                    )
+        return zeroed
+
+    def _hl_pnl_repair_row_stub(
+        self,
+        record,
+        *,
+        status: str,
+        error: Optional[str] = None,
+        fills_available: bool = False,
+    ) -> Dict[str, Any]:
+        custom_info = {}
+        try:
+            custom_info = json.loads(record.final_state) if record.final_state else {}
+        except (json.JSONDecodeError, TypeError):
+            custom_info = {}
+        return {
+            "executor_id": record.executor_id,
+            "trading_pair": record.trading_pair,
+            "close_type": record.close_type,
+            "closed_at": record.closed_at.isoformat() if record.closed_at else None,
+            "stored_pnl": float(record.net_pnl_quote or 0),
+            "stored_pct": float(record.net_pnl_pct or 0),
+            "stored_fees": float(record.cum_fees_quote or 0),
+            "stored_close": float(custom_info.get("close_price") or 0) or None,
+            "status": status,
+            "fills_available": fills_available,
+            "error": error,
+        }
+
+    async def _build_hl_pnl_repair_row(
+        self,
+        record,
+        fills_by_oid: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        stub = self._hl_pnl_repair_row_stub(
+            record, status="skipped_no_fills", fills_available=bool(fills_by_oid)
+        )
+        if not fills_by_oid:
+            stub["status"] = "skipped_no_fills"
+            return stub
+
+        custom_info = {}
+        try:
+            custom_info = json.loads(record.final_state) if record.final_state else {}
+        except (json.JSONDecodeError, TypeError):
+            custom_info = {}
+
+        open_oid, close_oid, open_keys, close_keys = await self._resolve_executor_fill_oids(
+            record, custom_info
+        )
+        if not open_oid or not close_oid:
+            stub["status"] = "skipped_unresolved_oids"
+            return stub
+
+        try:
+            config = json.loads(record.config) if record.config else {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        is_buy = not self._parse_config_side_is_short(
+            config if isinstance(config, dict) else {}
+        )
+
+        open_fills = self._fills_for_oids(fills_by_oid, *open_keys)
+        close_fills = self._fills_for_oids(fills_by_oid, *close_keys)
+        if not open_fills or not close_fills:
+            stub["status"] = "skipped_no_fills"
+            stub["open_oid"] = open_oid
+            stub["close_oid"] = close_oid
+            stub["open_fill_n"] = len(open_fills)
+            stub["close_fill_n"] = len(close_fills)
+            return stub
+
+        breakdown = self._hl_pnl_breakdown_from_fills(open_fills, close_fills, is_buy=is_buy)
+        if not breakdown:
+            stub["status"] = "skipped_no_fills"
+            return stub
+
+        stored_pnl = Decimal(str(record.net_pnl_quote or 0))
+        proposed = breakdown["proposed_pnl"]
+        hl_net = breakdown["hl_net_pnl"]
+        delta_stored = proposed - stored_pnl
+        delta_hl = proposed - hl_net
+        match_hl = abs(delta_hl) <= self._HL_PNL_MATCH_EPSILON
+        would_change = abs(delta_stored) >= self._HL_PNL_UPDATE_EPSILON
+
+        return {
+            "executor_id": record.executor_id,
+            "trading_pair": record.trading_pair,
+            "close_type": record.close_type,
+            "closed_at": record.closed_at.isoformat() if record.closed_at else None,
+            "open_oid": open_oid,
+            "close_oid": close_oid,
+            "stored_pnl": float(stored_pnl),
+            "stored_pct": float(record.net_pnl_pct or 0),
+            "stored_fees": float(record.cum_fees_quote or 0),
+            "stored_close": float(custom_info.get("close_price") or 0) or None,
+            "proposed_pnl": float(proposed),
+            "proposed_pct": float(breakdown["proposed_pct"]),
+            "proposed_fees": float(breakdown["proposed_fees"]),
+            "proposed_close": float(breakdown["proposed_close"])
+            if breakdown["proposed_close"] is not None
+            else None,
+            "hl_closed_pnl": float(breakdown["hl_closed_pnl"]),
+            "hl_fees_open": float(breakdown["hl_fees_open"]),
+            "hl_fees_close": float(breakdown["hl_fees_close"]),
+            "hl_fees_total": float(breakdown["hl_fees_total"]),
+            "hl_net_pnl": float(hl_net),
+            "delta_stored_vs_proposed": float(delta_stored),
+            "delta_proposed_vs_hl": float(delta_hl),
+            "match_hl": match_hl,
+            "size_mismatch": bool(breakdown["size_mismatch"]),
+            "method": breakdown["method"],
+            "open_base": float(breakdown["open_base"]),
+            "close_base": float(breakdown["close_base"]),
+            "status": "would_update" if would_change else "unchanged",
+            "fills_available": True,
+        }
 
     async def _refresh_position_executor_orders_before_persist(
         self,

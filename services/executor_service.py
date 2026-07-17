@@ -1018,7 +1018,14 @@ class ExecutorService:
         return lowered.startswith("recovered_") or lowered.startswith("hbpt")
 
     def _executor_may_need_hl_pnl_repair(self, record) -> bool:
-        """Return True only for terminated HL executors likely missing fill-based PnL."""
+        """Return True for terminated HL executors that may need userFills PnL repair.
+
+        Triggers when:
+        - recovered/synthetic open order ids, or
+        - stored net PnL is zero despite a real close, or
+        - real open+close order ids exist (MARKET closes can be FILLED with null
+          average_fill_price, freezing mid as close_price until repaired from fills).
+        """
         if (
             record.executor_type != "position_executor"
             or record.status != "TERMINATED"
@@ -1037,6 +1044,14 @@ class ExecutorService:
             (record.net_pnl_quote or 0) == 0
             and record.close_type
             and record.close_type not in ("STALE_DUPLICATE", "MISTAKE", "MANUAL")
+        ):
+            return True
+        # Real open+close client order ids: attempt HL userFills repair (cached, no-op if
+        # fills missing or PnL already matches).
+        if (
+            len(order_ids) >= 2
+            and not self._is_synthetic_order_id(str(order_ids[0]))
+            and not self._is_synthetic_order_id(str(order_ids[1]))
         ):
             return True
         return False
@@ -1120,6 +1135,45 @@ class ExecutorService:
             return []
         return fills_by_oid.get(str(oid), fills_by_oid.get(oid, []))
 
+    @classmethod
+    def _fills_for_oids(
+        cls,
+        fills_by_oid: Dict[str, List[Dict[str, Any]]],
+        *oids: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """Merge fill rows for any of the given exchange/client order ids (deduped)."""
+        out: List[Dict[str, Any]] = []
+        seen: set[tuple] = set()
+        for oid in oids:
+            for row in cls._fills_for_oid(fills_by_oid, oid or ""):
+                key = (
+                    row.get("tid"),
+                    row.get("time"),
+                    row.get("px"),
+                    row.get("sz"),
+                    row.get("side"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(row)
+        return out
+
+    @staticmethod
+    def _vwap_from_hl_fills(fills: List[Dict[str, Any]]) -> Optional[Decimal]:
+        base = Decimal("0")
+        quote = Decimal("0")
+        for row in fills:
+            sz = Decimal(str(row.get("sz", 0)))
+            px = Decimal(str(row.get("px", 0)))
+            if sz <= 0 or px <= 0:
+                continue
+            base += sz
+            quote += px * sz
+        if base <= 0:
+            return None
+        return quote / base
+
     @staticmethod
     def _compute_realized_pnl_from_hl_fills(
         open_fills: List[Dict[str, Any]],
@@ -1155,8 +1209,12 @@ class ExecutorService:
         self,
         record,
         custom_info: Dict[str, Any],
-    ) -> tuple[Optional[str], Optional[str]]:
-        """Resolve open/close exchange order ids for a terminated position executor."""
+    ) -> tuple[Optional[str], Optional[str], List[str], List[str]]:
+        """Resolve open/close order lookup keys (client + exchange ids) for HL fills.
+
+        Returns:
+            (open_client_oid, close_client_oid, open_lookup_keys, close_lookup_keys)
+        """
         order_ids = custom_info.get("order_ids") or []
         open_oid = str(order_ids[0]) if order_ids else None
         close_oid = str(order_ids[1]) if len(order_ids) > 1 else None
@@ -1164,11 +1222,12 @@ class ExecutorService:
             open_oid = None
         if self._is_synthetic_order_id(close_oid):
             close_oid = None
-        if open_oid and close_oid:
-            return open_oid, close_oid
+
+        open_keys: List[str] = [open_oid] if open_oid else []
+        close_keys: List[str] = [close_oid] if close_oid else []
 
         if not self.db_manager or not record.trading_pair:
-            return open_oid, close_oid
+            return open_oid, close_oid, open_keys, close_keys
 
         try:
             config = json.loads(record.config) if record.config else {}
@@ -1191,7 +1250,7 @@ class ExecutorService:
                     limit=100,
                 )
         except Exception:
-            return open_oid, close_oid
+            return open_oid, close_oid, open_keys, close_keys
 
         created_at = record.created_at
         closed_at = record.closed_at
@@ -1210,6 +1269,7 @@ class ExecutorService:
             for order in candidates:
                 if (order.trade_type or "").upper() == open_side:
                     open_oid = str(order.client_order_id)
+                    open_keys = [open_oid]
                     break
 
         if not close_oid:
@@ -1218,9 +1278,19 @@ class ExecutorService:
                     if open_oid and str(order.client_order_id) == open_oid:
                         continue
                     close_oid = str(order.client_order_id)
+                    close_keys = [close_oid]
                     break
 
-        return open_oid, close_oid
+        # Prefer looking up HL fills by exchange oid as well as client order id.
+        for order in candidates:
+            cid = str(order.client_order_id or "")
+            eid = str(order.exchange_order_id or "") if getattr(order, "exchange_order_id", None) else ""
+            if cid and open_oid and cid == open_oid and eid and eid not in open_keys:
+                open_keys.append(eid)
+            if cid and close_oid and cid == close_oid and eid and eid not in close_keys:
+                close_keys.append(eid)
+
+        return open_oid, close_oid, open_keys, close_keys
 
     async def _persist_repaired_executor_pnl(
         self,
@@ -1281,7 +1351,9 @@ class ExecutorService:
             return formatted
 
         custom_info = formatted.get("custom_info") or {}
-        open_oid, close_oid = await self._resolve_executor_fill_oids(record, custom_info)
+        open_oid, close_oid, open_keys, close_keys = await self._resolve_executor_fill_oids(
+            record, custom_info
+        )
         if not open_oid or not close_oid:
             return formatted
 
@@ -1291,8 +1363,8 @@ class ExecutorService:
             config = {}
         is_buy = not self._parse_config_side_is_short(config if isinstance(config, dict) else {})
 
-        open_fills = self._fills_for_oid(fills_by_oid, open_oid)
-        close_fills = self._fills_for_oid(fills_by_oid, close_oid)
+        open_fills = self._fills_for_oids(fills_by_oid, *open_keys)
+        close_fills = self._fills_for_oids(fills_by_oid, *close_keys)
         computed = self._compute_realized_pnl_from_hl_fills(
             open_fills,
             close_fills,
@@ -1305,13 +1377,24 @@ class ExecutorService:
         formatted["net_pnl_quote"] = float(net_pnl)
         formatted["net_pnl_pct"] = float(net_pnl_pct)
         formatted["filled_amount_quote"] = float(filled_quote)
+        fees = sum(
+            Decimal(str(row.get("fee", 0))) for row in (open_fills + close_fills)
+        )
+        formatted["cum_fees_quote"] = float(fees)
+
         stored_pnl = Decimal(str(record.net_pnl_quote or 0))
-        final_state_patch = None
+        final_state_patch = dict(custom_info)
         order_ids = custom_info.get("order_ids") or []
         if order_ids and self._is_synthetic_order_id(str(order_ids[0])):
-            final_state_patch = dict(custom_info)
             final_state_patch["order_ids"] = [open_oid, close_oid]
-            formatted["custom_info"] = final_state_patch
+        open_vwap = self._vwap_from_hl_fills(open_fills)
+        close_vwap = self._vwap_from_hl_fills(close_fills)
+        if open_vwap is not None:
+            final_state_patch["current_position_average_price"] = float(open_vwap)
+        if close_vwap is not None:
+            final_state_patch["close_price"] = float(close_vwap)
+        formatted["custom_info"] = final_state_patch
+
         if await self._persist_repaired_executor_pnl(
             record.executor_id,
             stored_pnl,
@@ -1325,8 +1408,8 @@ class ExecutorService:
             record.net_pnl_quote = net_pnl
             record.net_pnl_pct = net_pnl_pct
             record.filled_amount_quote = filled_quote
-            if final_state_patch:
-                record.final_state = json.dumps(final_state_patch, default=_json_default)
+            record.cum_fees_quote = fees
+            record.final_state = json.dumps(final_state_patch, default=_json_default)
         return formatted
 
     async def _refresh_position_executor_orders_before_persist(

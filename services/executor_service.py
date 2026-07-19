@@ -180,6 +180,10 @@ class ExecutorService:
         # Cached HL userFills keyed by (account, connector); avoids 429 bursts on executor search.
         self._hl_fills_cache: Dict[tuple[str, str], tuple[float, Dict[str, List[Dict[str, Any]]]]] = {}
         self._hl_fills_cache_ttl_seconds = 300.0
+        # Brief cooldown after HL userFills failures so concurrent get_executors
+        # callers do not each re-hit a failing API while holding resources.
+        self._hl_fills_error_ttl_seconds = 30.0
+        self._hl_fills_error_until: Dict[tuple[str, str], float] = {}
         self._hl_fills_fetch_locks: Dict[tuple[str, str], asyncio.Lock] = {}
         self._hl_fills_last_error: Optional[str] = None
 
@@ -1117,6 +1121,10 @@ class ExecutorService:
         cached = self._hl_fills_cache.get(cache_key)
         if cached and (time.monotonic() - cached[0]) < self._hl_fills_cache_ttl_seconds:
             return cached[1]
+        error_until = self._hl_fills_error_until.get(cache_key)
+        if error_until and time.monotonic() < error_until:
+            self._hl_fills_last_error = self._hl_fills_last_error or "cached_hl_fills_error"
+            return {}
 
         if cache_key not in self._hl_fills_fetch_locks:
             self._hl_fills_fetch_locks[cache_key] = asyncio.Lock()
@@ -1125,6 +1133,10 @@ class ExecutorService:
             cached = self._hl_fills_cache.get(cache_key)
             if cached and (time.monotonic() - cached[0]) < self._hl_fills_cache_ttl_seconds:
                 return cached[1]
+            error_until = self._hl_fills_error_until.get(cache_key)
+            if error_until and time.monotonic() < error_until:
+                self._hl_fills_last_error = self._hl_fills_last_error or "cached_hl_fills_error"
+                return {}
 
             if ensure_init:
                 connector = await self._ensure_hyperliquid_connector(
@@ -1165,10 +1177,14 @@ class ExecutorService:
                     if cloid:
                         by_oid.setdefault(cloid, []).append(row)
                 self._hl_fills_cache[cache_key] = (time.monotonic(), by_oid)
+                self._hl_fills_error_until.pop(cache_key, None)
                 self._hl_fills_last_error = None
                 return by_oid
             except Exception as exc:
                 self._hl_fills_last_error = str(exc)
+                self._hl_fills_error_until[cache_key] = (
+                    time.monotonic() + self._hl_fills_error_ttl_seconds
+                )
                 logger.warning(
                     "Could not load Hyperliquid fills for %s/%s: %s",
                     account_name,
@@ -2616,30 +2632,30 @@ class ExecutorService:
                         limit=limit
                     )
 
-                    repair_candidates = [
-                        r for r in db_executors if self._executor_may_need_hl_pnl_repair(r)
-                    ]
-                    fills_by_oid: Dict[str, List[Dict[str, Any]]] = {}
-                    if repair_candidates:
-                        repair_account = account_name or self.default_account
-                        repair_connector = connector_name or "hyperliquid_perpetual"
-                        fills_by_oid = await self._load_hyperliquid_fills_by_oid(
-                            repair_account, repair_connector
-                        )
+                repair_candidates = [
+                    r for r in db_executors if self._executor_may_need_hl_pnl_repair(r)
+                ]
+                fills_by_oid: Dict[str, List[Dict[str, Any]]] = {}
+                if repair_candidates:
+                    repair_account = account_name or self.default_account
+                    repair_connector = connector_name or "hyperliquid_perpetual"
+                    fills_by_oid = await self._load_hyperliquid_fills_by_oid(
+                        repair_account, repair_connector
+                    )
 
-                    for record in db_executors:
-                        # Skip if already in active executors (safety check)
-                        if record.executor_id in self._active_executors:
-                            continue
-                        # Stale RUNNING rows left in DB must not appear as live executors.
-                        if record.status == "RUNNING":
-                            continue
-                        formatted = self._format_db_record(record)
-                        if fills_by_oid and self._executor_may_need_hl_pnl_repair(record):
-                            formatted = await self._repair_executor_pnl_from_hl_fills(
-                                formatted, record, fills_by_oid
-                            )
-                        result.append(formatted)
+                for record in db_executors:
+                    # Skip if already in active executors (safety check)
+                    if record.executor_id in self._active_executors:
+                        continue
+                    # Stale RUNNING rows left in DB must not appear as live executors.
+                    if record.status == "RUNNING":
+                        continue
+                    formatted = self._format_db_record(record)
+                    if fills_by_oid and self._executor_may_need_hl_pnl_repair(record):
+                        formatted = await self._repair_executor_pnl_from_hl_fills(
+                            formatted, record, fills_by_oid
+                        )
+                    result.append(formatted)
             except Exception as e:
                 logger.error(f"Error fetching executors from database: {e}")
 
@@ -2667,20 +2683,20 @@ class ExecutorService:
             try:
                 async with self.db_manager.get_session_context() as session:
                     repo = ExecutorRepository(session)
-
                     record = await repo.get_executor_by_id(executor_id)
-                    if record:
-                        formatted = self._format_db_record(record)
-                        if self._executor_may_need_hl_pnl_repair(record):
-                            fills_by_oid = await self._load_hyperliquid_fills_by_oid(
-                                record.account_name or self.default_account,
-                                record.connector_name,
+
+                if record:
+                    formatted = self._format_db_record(record)
+                    if self._executor_may_need_hl_pnl_repair(record):
+                        fills_by_oid = await self._load_hyperliquid_fills_by_oid(
+                            record.account_name or self.default_account,
+                            record.connector_name,
+                        )
+                        if fills_by_oid:
+                            formatted = await self._repair_executor_pnl_from_hl_fills(
+                                formatted, record, fills_by_oid
                             )
-                            if fills_by_oid:
-                                formatted = await self._repair_executor_pnl_from_hl_fills(
-                                    formatted, record, fills_by_oid
-                                )
-                        return formatted
+                    return formatted
             except Exception as e:
                 logger.error(f"Error fetching executor from database: {e}")
 

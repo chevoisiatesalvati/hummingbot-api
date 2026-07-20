@@ -6,6 +6,7 @@ without Docker containers or full strategy setup.
 import asyncio
 import json
 import logging
+import types
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -542,16 +543,66 @@ class ExecutorService:
             config.triple_barrier_config.take_profit
             and config.triple_barrier_config.take_profit_order_type.is_limit_type()
         )
-        if uses_limit_tp:
-            executor._suppress_take_profit_limit_after_recovery = True
+        adopted = await self._adopt_take_profit_limit_order_from_connector(
+            executor, account_name
+        )
+        if uses_limit_tp and hasattr(executor, "_suppress_take_profit_limit_after_recovery"):
+            executor._suppress_take_profit_limit_after_recovery = not adopted
 
-        adopted = executor._adopt_take_profit_limit_order_from_connector()
-        if uses_limit_tp and not adopted:
-            executor._suppress_take_profit_limit_after_recovery = True
-        elif uses_limit_tp and adopted:
-            executor._suppress_take_profit_limit_after_recovery = False
-
+        self._mark_position_executor_recovered(executor)
         return True
+
+    @staticmethod
+    def _mark_position_executor_recovered(executor: ExecutorBase) -> None:
+        """Skip open-order budget validation for executors seeded from live exchange state."""
+        executor._recovered_from_exchange = True
+
+        async def _skip_balance_validation(_self) -> None:
+            return
+
+        executor.validate_sufficient_balance = types.MethodType(
+            _skip_balance_validation, executor
+        )
+
+    async def _adopt_take_profit_limit_order_from_connector(
+        self,
+        executor: ExecutorBase,
+        account_name: str,
+    ) -> bool:
+        """Bind an existing exchange TP limit order to a recovered PositionExecutor."""
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+        config = executor.config
+        if (
+            not config.triple_barrier_config.take_profit
+            or not config.triple_barrier_config.take_profit_order_type.is_limit_type()
+        ):
+            return False
+
+        connector = await self._get_trading_interface(account_name).ensure_connector(
+            config.connector_name
+        )
+        close_side = executor.close_order_side
+        for order in connector.in_flight_orders.values():
+            if order.trading_pair != config.trading_pair:
+                continue
+            if order.trade_type != close_side:
+                continue
+            if not order.order_type.is_limit_type():
+                continue
+            if order.is_done:
+                continue
+            tracked = TrackedOrder(order_id=order.client_order_id)
+            tracked.order = order
+            executor._take_profit_limit_order = tracked
+            logger.info(
+                "Recovered TP limit order %s for executor %s (%s)",
+                order.client_order_id,
+                config.id,
+                config.trading_pair,
+            )
+            return True
+        return False
 
     async def _ensure_exchange_open_orders_imported(
         self, account_name: str, connector_name: str

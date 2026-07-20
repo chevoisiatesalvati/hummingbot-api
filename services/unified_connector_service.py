@@ -127,6 +127,11 @@ class UnifiedConnectorService:
                     account_name, connector_name
                 )
                 self._trading_connectors[account_name][connector_name] = connector
+            else:
+                from utils.hyperliquid_price_quantize import patch_hyperliquid_quantize_order_price
+                patch_hyperliquid_quantize_order_price(
+                    self._trading_connectors[account_name][connector_name]
+                )
 
             return self._trading_connectors[account_name][connector_name]
 
@@ -845,16 +850,44 @@ class UnifiedConnectorService:
             connector_names = self.list_available_credentials(account_name)
 
             for connector_name in connector_names:
-                try:
-                    logger.info(f"Initializing connector: {account_name}/{connector_name}")
-                    await self.get_trading_connector(account_name, connector_name)
+                initialized = await self._initialize_trading_connector_with_retry(
+                    account_name, connector_name
+                )
+                if initialized:
                     total_initialized += 1
-                except Exception as e:
-                    logger.error(f"Failed to initialize {account_name}/{connector_name}: {e}")
-                    # Continue with other connectors even if one fails
-                    continue
 
         logger.info(f"Initialized {total_initialized} trading connectors across {len(accounts)} accounts")
+
+    async def _initialize_trading_connector_with_retry(
+        self,
+        account_name: str,
+        connector_name: str,
+        max_attempts: int = 4,
+        base_delay_seconds: float = 2.0,
+    ) -> bool:
+        """Initialize a connector with backoff when Hyperliquid returns HTTP 429."""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"Initializing connector: {account_name}/{connector_name}")
+                await self.get_trading_connector(account_name, connector_name)
+                return True
+            except Exception as e:
+                is_rate_limited = "HTTP status is 429" in str(e)
+                if is_rate_limited and attempt < max_attempts:
+                    delay = base_delay_seconds * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Rate limited initializing %s/%s (attempt %d/%d); retrying in %.1fs",
+                        account_name,
+                        connector_name,
+                        attempt,
+                        max_attempts,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.error(f"Failed to initialize {account_name}/{connector_name}: {e}")
+                return False
+        return False
 
     # =========================================================================
     # Order Management

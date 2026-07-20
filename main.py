@@ -1,5 +1,6 @@
 import logging
 import secrets
+import time
 from contextlib import asynccontextmanager
 from typing import Annotated
 from urllib.parse import urlparse
@@ -257,23 +258,33 @@ async def lifespan(app: FastAPI):
 
     # Initialize all trading connectors FIRST (before any service that might use them)
     # This ensures OrdersRecorder is properly attached before any concurrent access
+    startup_t0 = time.monotonic()
     logging.info("Initializing all trading connectors...")
     await connector_service.initialize_all_trading_connectors()
+    connectors_ms = int((time.monotonic() - startup_t0) * 1000)
 
     # Reconcile persisted active orders against the exchange (e.g. after an API
     # restart/crash that lost in-memory references). Confirmed-closed orders are
     # marked terminal; still-open orders are re-tracked so they stay cancelable.
     # Runs after connectors reload their persisted in-flight orders.
+    reconcile_started = time.monotonic()
     await connector_service.reconcile_active_orders()
+    reconcile_ms = int((time.monotonic() - reconcile_started) * 1000)
 
     bots_orchestrator.start()
     market_data_service.start()
     await market_data_service.warmup_rate_oracle()
     executor_service.start()
-    await executor_service.recover_running_executors_from_db()
-    await executor_service.cleanup_orphaned_executors()
-    await executor_service.recover_positions_from_db()
     accounts_service.start()
+    executor_service.schedule_startup_recovery()
+
+    logging.info(
+        "Startup timing (ms): connectors=%d reconcile=%d pre_recovery=%d "
+        "(executor recovery running in background)",
+        connectors_ms,
+        reconcile_ms,
+        int((time.monotonic() - startup_t0) * 1000),
+    )
 
     # =========================================================================
     # 7. Store services in app state

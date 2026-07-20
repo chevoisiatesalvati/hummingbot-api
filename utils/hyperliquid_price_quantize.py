@@ -7,12 +7,18 @@ from typing import Any
 
 
 def quantize_hyperliquid_order_price(connector: Any, trading_pair: str, price: Decimal) -> Decimal:
-    """Round price to exchange min_price_increment when trading rules are loaded."""
+    """Align price to Hyperliquid rules: max 5 significant figures, then tick size.
+
+    Tick-only rounding can produce prices like 68013.8 (6 sig figs) which HL rejects
+    with "Price must be divisible by tick size".
+    """
+    # HL allows at most 5 significant figures on limitPx
+    price = Decimal(str(float(f"{price:.5g}")))
     trading_rule = connector._trading_rules.get(trading_pair)
     if trading_rule is not None and trading_rule.min_price_increment:
         tick = trading_rule.min_price_increment
-        return (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
-    return Decimal(round(float(f"{price:.5g}"), 6))
+        price = (price / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * tick
+    return price
 
 
 def patch_hyperliquid_quantize_order_price(connector: Any) -> bool:

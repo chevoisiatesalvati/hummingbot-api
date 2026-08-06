@@ -1,9 +1,38 @@
 import logging
-from typing import Any, Dict, List, Optional
+import ssl
+from typing import Any, Callable, Dict, List, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# Connectors whose bare name maps to a router-type swap provider on Gateway.
+# All other connectors default to their CLMM route (meteora, orca, raydium, pancakeswap-sol).
+ROUTER_CONNECTORS = {"jupiter", "0x", "uniswap", "pancakeswap"}
+
+
+class GatewayError(Exception):
+    """A Gateway HTTP request that completed with a non-OK status."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
+
+
+def check_gateway_error(result: Optional[Any]) -> Any:
+    """
+    Validate a GatewayClient response, raising instead of letting error shapes flow onward.
+
+    ``_request`` returns ``{"error": <str>, "status": <int>}`` on non-OK HTTP responses and
+    ``None`` on connection errors. Callers that treat those as data silently corrupt results
+    (e.g. rendering a 404 as price 0), so pass every response through this helper unless the
+    caller explicitly branches on the error shape.
+    """
+    if result is None:
+        raise GatewayError("No response from Gateway (connection error)", 503)
+    if isinstance(result, dict) and set(result.keys()) == {"error", "status"}:
+        raise GatewayError(str(result["error"]), int(result["status"]))
+    return result
 
 
 class GatewayClient:
@@ -12,9 +41,29 @@ class GatewayClient:
     Provides essential functionality for wallet management and balance queries.
     """
 
-    def __init__(self, base_url: str = "http://localhost:15888"):
+    def __init__(
+        self,
+        base_url: str = "http://localhost:15888",
+        ssl_context_factory: Optional[Callable[[], ssl.SSLContext]] = None,
+    ):
+        """
+        Args:
+            base_url: Gateway base URL. Use an ``https://`` scheme together with
+                ``ssl_context_factory`` to talk to a secured (mTLS) Gateway (SEC-048).
+            ssl_context_factory: Zero-arg callable returning a client SSLContext presenting the
+                shared client cert. Called lazily (and cached) on the first ``https`` request, so
+                certs generated *after* the API started — e.g. once the Gateway is started — are
+                picked up without an API restart. Ignored for plain ``http://``.
+        """
         self.base_url = base_url
+        self._ssl_context_factory = ssl_context_factory
+        self._ssl_context: Optional[ssl.SSLContext] = None
+        self._is_https = base_url.lower().startswith("https://")
         self._session: Optional[aiohttp.ClientSession] = None
+        # Guards the "certs unavailable" warning so background pollers don't spam it every cycle
+        # while the Gateway is simply not started. Logged once on the transition, then suppressed
+        # until certs become available again.
+        self._certs_unavailable_warned = False
 
     @staticmethod
     def parse_network_id(network_id: str) -> tuple[str, str]:
@@ -43,10 +92,29 @@ class GatewayClient:
             raise ValueError(f"No valid wallet configured for chain '{chain}' (found placeholder: {default_wallet})")
         return default_wallet
 
+    def _get_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """Lazily build and cache the client SSLContext for https Gateways.
+
+        Deferred so certs created after startup (once the Gateway is started) are picked up.
+        Raises FileNotFoundError (from the factory) while the cert set is still absent.
+        """
+        if not self._is_https or self._ssl_context_factory is None:
+            return None
+        if self._ssl_context is None:
+            self._ssl_context = self._ssl_context_factory()
+            # Certs are now available; allow a fresh warning if they ever disappear again.
+            self._certs_unavailable_warned = False
+        return self._ssl_context
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            ssl_context = self._get_ssl_context()
+            if ssl_context is not None:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                self._session = aiohttp.ClientSession(connector=connector)
+            else:
+                self._session = aiohttp.ClientSession()
         return self._session
 
     async def close(self):
@@ -56,8 +124,21 @@ class GatewayClient:
 
     async def _request(self, method: str, path: str, params: Dict = None, json: Dict = None) -> Optional[Dict]:
         """Make HTTP request to Gateway"""
-        session = await self._get_session()
         url = f"{self.base_url}/{path}"
+
+        try:
+            session = await self._get_session()
+        except FileNotFoundError as e:
+            # https Gateway selected but the shared certs aren't available yet (Gateway not
+            # started). Return a clean error instead of crashing the caller. Warn only once on
+            # the transition so background pollers don't spam the log every cycle while the
+            # Gateway stays unstarted (a normal, optional state).
+            if not self._certs_unavailable_warned:
+                logger.warning(f"Gateway mTLS certs unavailable, cannot reach {url}: {e}")
+                self._certs_unavailable_warned = True
+            else:
+                logger.debug(f"Gateway mTLS certs still unavailable, cannot reach {url}: {e}")
+            return {"error": "Gateway client certificates not available; start the Gateway first", "status": 503}
 
         try:
             if method == "GET":
@@ -187,6 +268,10 @@ class GatewayClient:
     async def get_chains(self) -> Dict:
         """Get available chains"""
         return await self._request("GET", "config/chains")
+
+    async def get_connectors(self) -> Dict:
+        """Get available connectors with their trading types"""
+        return await self._request("GET", "config/connectors")
 
     async def get_default_network(self, chain: str) -> Optional[str]:
         """Get default network for a chain"""
@@ -330,48 +415,59 @@ class GatewayClient:
             "network": network
         })
 
-    async def pool_info(self, connector: str, network: str, pool_address: str) -> Dict:
-        """Get detailed information about a specific pool"""
-        return await self._request("POST", "clmm/liquidity/pool", json={
-            "connector": connector,
-            "network": network,
-            "poolAddress": pool_address
-        })
+    # ============================================
+    # Swap Operations (unified /trading/swap endpoints)
+    # ============================================
 
-    # ============================================
-    # Swap Operations
-    # ============================================
+    @staticmethod
+    def normalize_swap_connector(connector: str) -> str:
+        """
+        Normalize a connector name to Gateway's 'name/type' swap-provider format.
+
+        'jupiter' -> 'jupiter/router', 'meteora' -> 'meteora/clmm',
+        'raydium/amm' -> 'raydium/amm' (already typed, passed through).
+        """
+        if "/" in connector:
+            return connector
+        connector_type = "router" if connector in ROUTER_CONNECTORS else "clmm"
+        return f"{connector}/{connector_type}"
 
     async def quote_swap(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         base_asset: str,
         quote_asset: str,
         amount: float,
         side: str,
-        slippage_pct: Optional[float] = None,
-        pool_address: Optional[str] = None
+        slippage_pct: Optional[float] = None
     ) -> Dict:
-        """Get a quote for a swap"""
-        payload = {
-            "network": network,
+        """
+        Get a swap quote via Gateway's unified /trading/swap/quote endpoint.
+
+        Args:
+            connector: Swap provider, either bare ('jupiter', 'meteora') or typed
+                ('jupiter/router', 'raydium/amm', 'meteora/clmm').
+            chain_network: 'chain-network' format (e.g. 'solana-mainnet-beta').
+                For amm/clmm providers Gateway resolves the pool from its pool list.
+        """
+        params = {
+            "chainNetwork": chain_network,
+            "connector": self.normalize_swap_connector(connector),
             "baseToken": base_asset,
             "quoteToken": quote_asset,
             "amount": str(amount),
             "side": side.upper()
         }
         if slippage_pct is not None:
-            payload["slippagePct"] = slippage_pct
-        if pool_address:
-            payload["poolAddress"] = pool_address
+            params["slippagePct"] = str(slippage_pct)
 
-        return await self._request("GET", f"connectors/{connector}/router/quote-swap", params=payload)
+        return await self._request("GET", "trading/swap/quote", params=params)
 
     async def execute_swap(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         wallet_address: str,
         base_asset: str,
         quote_asset: str,
@@ -379,42 +475,29 @@ class GatewayClient:
         side: str,
         slippage_pct: Optional[float] = None
     ) -> Dict:
-        """Execute a swap"""
+        """Execute a swap via Gateway's unified /trading/swap/execute endpoint."""
         payload = {
-            "network": network,
+            "chainNetwork": chain_network,
+            "connector": self.normalize_swap_connector(connector),
             "walletAddress": wallet_address,
             "baseToken": base_asset,
             "quoteToken": quote_asset,
-            "amount": str(amount),
+            "amount": amount,
             "side": side.upper()
         }
         if slippage_pct is not None:
             payload["slippagePct"] = slippage_pct
 
-        return await self._request("POST", f"connectors/{connector}/router/execute-swap", json=payload)
-
-    async def execute_quote(
-        self,
-        connector: str,
-        network: str,
-        wallet_address: str,
-        quote_id: str
-    ) -> Dict:
-        """Execute a previously obtained quote"""
-        return await self._request("POST", f"connectors/{connector}/router/execute-quote", json={
-            "network": network,
-            "address": wallet_address,
-            "quoteId": quote_id
-        })
+        return await self._request("POST", "trading/swap/execute", json=payload)
 
     # ============================================
-    # Liquidity Operations - CLMM (Concentrated Liquidity)
+    # Liquidity Operations - CLMM (unified /trading/clmm endpoints)
     # ============================================
 
     async def clmm_open_position(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         wallet_address: str,
         pool_address: str,
         lower_price: float,
@@ -426,29 +509,30 @@ class GatewayClient:
     ) -> Dict:
         """Open a NEW CLMM position with initial liquidity"""
         payload = {
-            "network": network,
+            "connector": connector,
+            "chainNetwork": chain_network,
             "walletAddress": wallet_address,
             "poolAddress": pool_address,
             "lowerPrice": lower_price,
             "upperPrice": upper_price
         }
         if base_token_amount is not None:
-            payload["baseTokenAmount"] = str(base_token_amount)
+            payload["baseTokenAmount"] = base_token_amount
         if quote_token_amount is not None:
-            payload["quoteTokenAmount"] = str(quote_token_amount)
+            payload["quoteTokenAmount"] = quote_token_amount
         if slippage_pct is not None:
             payload["slippagePct"] = slippage_pct
 
-        # Add any connector-specific parameters
+        # Connector-specific parameters (e.g. Meteora's strategyType)
         if extra_params:
             payload.update(extra_params)
 
-        return await self._request("POST", f"connectors/{connector}/clmm/open-position", json=payload)
+        return await self._request("POST", "trading/clmm/open", json=payload)
 
     async def clmm_add_liquidity(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         wallet_address: str,
         position_address: str,
         base_token_amount: Optional[float] = None,
@@ -458,29 +542,30 @@ class GatewayClient:
         """Add more liquidity to an existing CLMM position"""
         payload = {
             "connector": connector,
-            "network": network,
-            "address": wallet_address,
+            "chainNetwork": chain_network,
+            "walletAddress": wallet_address,
             "positionAddress": position_address
         }
         if base_token_amount is not None:
-            payload["baseTokenAmount"] = str(base_token_amount)
+            payload["baseTokenAmount"] = base_token_amount
         if quote_token_amount is not None:
-            payload["quoteTokenAmount"] = str(quote_token_amount)
+            payload["quoteTokenAmount"] = quote_token_amount
         if slippage_pct is not None:
             payload["slippagePct"] = slippage_pct
 
-        return await self._request("POST", "clmm/liquidity/add", json=payload)
+        return await self._request("POST", "trading/clmm/add", json=payload)
 
     async def clmm_close_position(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         wallet_address: str,
         position_address: str
     ) -> Dict:
         """Close a CLMM position completely"""
-        return await self._request("POST", f"connectors/{connector}/clmm/close-position", json={
-            "network": network,
+        return await self._request("POST", "trading/clmm/close", json={
+            "connector": connector,
+            "chainNetwork": chain_network,
             "walletAddress": wallet_address,
             "positionAddress": position_address
         })
@@ -488,18 +573,18 @@ class GatewayClient:
     async def clmm_remove_liquidity(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         wallet_address: str,
         position_address: str,
         percentage: float
     ) -> Dict:
         """Remove liquidity from a CLMM position (partial)"""
-        return await self._request("POST", "clmm/liquidity/remove", json={
+        return await self._request("POST", "trading/clmm/remove", json={
             "connector": connector,
-            "network": network,
-            "address": wallet_address,
+            "chainNetwork": chain_network,
+            "walletAddress": wallet_address,
             "positionAddress": position_address,
-            "percentage": percentage
+            "percentageToRemove": percentage
         })
 
     async def clmm_position_info(
@@ -571,28 +656,61 @@ class GatewayClient:
     async def clmm_collect_fees(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         wallet_address: str,
         position_address: str
     ) -> Dict:
         """Collect accumulated fees from a CLMM position"""
-        return await self._request("POST", f"connectors/{connector}/clmm/collect-fees", json={
-            "network": network,
-            "address": wallet_address,
+        return await self._request("POST", "trading/clmm/collect-fees", json={
+            "connector": connector,
+            "chainNetwork": chain_network,
+            "walletAddress": wallet_address,
             "positionAddress": position_address
         })
 
     async def clmm_pool_info(
         self,
         connector: str,
-        network: str,
+        chain_network: str,
         pool_address: str
     ) -> Dict:
         """Get detailed CLMM pool information by pool address"""
-        return await self._request("GET", f"connectors/{connector}/clmm/pool-info", params={
-            "network": network,
+        return await self._request("GET", "trading/clmm/pool-info", params={
+            "connector": connector,
+            "chainNetwork": chain_network,
             "poolAddress": pool_address
         })
+
+    async def clmm_fetch_pools(
+        self,
+        connector: str,
+        network: str,
+        page: int = 0,
+        limit: int = 50,
+        query: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        include_unverified: bool = True
+    ) -> Dict:
+        """
+        Discover CLMM pools from the connector's own listing API (meteora, orca).
+
+        This is a per-connector Gateway route (no unified equivalent): it proxies the
+        DEX's pool-discovery API rather than Gateway's saved pool list.
+        """
+        params = {
+            "network": network,
+            "limit": limit,
+        }
+        if page > 0:
+            params["page"] = page
+        if query:
+            params["query"] = query
+        if sort_by:
+            params["sortBy"] = sort_by
+        if not include_unverified:
+            params["includeUnverified"] = "false"
+
+        return await self._request("GET", f"connectors/{connector}/clmm/fetch-pools", params=params)
 
     # ============================================
     # Transaction Polling

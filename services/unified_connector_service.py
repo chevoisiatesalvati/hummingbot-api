@@ -26,7 +26,6 @@ from hummingbot.connector.gateway.gateway import Gateway
 from hummingbot.connector.perpetual_derivative_py_base import PerpetualDerivativePyBase
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
 
 from utils.file_system import fs_util
@@ -34,6 +33,13 @@ from utils.hummingbot_api_config_adapter import HummingbotAPIConfigAdapter
 from utils.security import BackendAPISecurity
 
 logger = logging.getLogger(__name__)
+
+
+class UnknownConnectorError(ValueError):
+    """Raised when a connector name is not a known Hummingbot connector.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep working.
+    """
 
 
 class UnifiedConnectorService:
@@ -74,6 +80,14 @@ class UnifiedConnectorService:
         # Connector settings cache
         self._conn_settings = AllConnectorSettings.get_connector_settings()
 
+        # Rate provider for trade-volume telemetry (set to MarketDataService by main on startup).
+        # Exposes get_pair_rate(pair) -> Decimal, the RateOracle-compatible interface.
+        self._rate_provider = None
+
+    def set_rate_provider(self, rate_provider):
+        """Set the rate provider used by trade-volume telemetry (MarketDataService)."""
+        self._rate_provider = rate_provider
+
     def _is_perpetual_connector(self, connector: ConnectorBase) -> bool:
         """Check if connector is a perpetual derivative connector.
 
@@ -84,6 +98,17 @@ class UnifiedConnectorService:
             True if perpetual connector, False otherwise
         """
         return isinstance(connector, PerpetualDerivativePyBase)
+
+    def is_gateway_connector(self, connector: ConnectorBase) -> bool:
+        """Check if connector is a unified Gateway (on-chain) connector.
+
+        Args:
+            connector: The connector instance to check
+
+        Returns:
+            True if Gateway connector, False otherwise
+        """
+        return isinstance(connector, Gateway)
 
     # =========================================================================
     # Trading Connector Management (authenticated, per-account)
@@ -170,6 +195,14 @@ class UnifiedConnectorService:
     # =========================================================================
     # Data Connector Management (non-authenticated, shared)
     # =========================================================================
+
+    def is_known_connector(self, connector_name: str) -> bool:
+        """True if the name is a known Hummingbot exchange connector.
+
+        Gateway network connectors (e.g. 'solana-mainnet-beta') are not in AllConnectorSettings
+        and therefore return False.
+        """
+        return connector_name in self._conn_settings
 
     def get_data_connector(self, connector_name: str) -> ConnectorBase:
         """
@@ -679,7 +712,7 @@ class UnifiedConnectorService:
         """Create a non-authenticated data connector."""
         conn_setting = self._conn_settings.get(connector_name)
         if not conn_setting:
-            raise ValueError(f"Connector {connector_name} not found")
+            raise UnknownConnectorError(f"Connector {connector_name} not found")
 
         # Get config keys but don't use real API keys
         connector_config = AllConnectorSettings.get_connector_config_keys(connector_name)
@@ -1182,7 +1215,10 @@ class UnifiedConnectorService:
 
         try:
             instance_id = f"{account_name}_hbotapi"
-            rate_provider = RateOracle.get_instance()
+            rate_provider = self._rate_provider
+            if rate_provider is None:
+                logger.debug(f"No rate provider set, skipping trade-volume metrics for {connector_name}")
+                return
 
             metrics_collector = TradeVolumeMetricCollector(
                 connector=connector,

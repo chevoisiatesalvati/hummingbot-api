@@ -17,6 +17,7 @@ from services.gateway_wallet_service import GatewayWalletService, balance_entry
 from services.perpetual_trading_service import PerpetualTradingService
 from services.portfolio_analytics_service import PortfolioAnalyticsService
 from utils.file_system import fs_util
+from utils.gateway_certs import build_client_ssl_context
 
 # Create module-specific logger
 logger = logging.getLogger(__name__)
@@ -109,12 +110,18 @@ class AccountsService:
         self._market_data_service = market_data_service  # MarketDataService
         self._trading_service = trading_service  # TradingService
 
-        # Initialize Gateway client
+        # Initialize Gateway client. For a secured (https) Gateway, present the shared client
+        # cert over mTLS; certs are decrypted with CONFIG_PASSWORD (SEC-048). The SSL context is
+        # built lazily so certs generated once the Gateway is started are picked up without an
+        # API restart.
         self.gateway_base_url = gateway_url
-        self.gateway_client = GatewayClient(gateway_url)
+        ssl_context_factory = None
+        if gateway_url.lower().startswith("https://"):
+            ssl_context_factory = lambda: build_client_ssl_context(settings.security.config_password)  # noqa: E731
+        self.gateway_client = GatewayClient(gateway_url, ssl_context_factory=ssl_context_factory)
 
         # Composed services: gateway wallet CRUD/balances, perpetual trading and pure portfolio analytics
-        self.gateway_wallet_service = GatewayWalletService(self.gateway_client)
+        self.gateway_wallet_service = GatewayWalletService(self.gateway_client, market_data_service)
         self.perpetual_trading_service = PerpetualTradingService(self.get_connector_instance)
         self.portfolio_analytics_service = PortfolioAnalyticsService()
 
@@ -131,12 +138,23 @@ class AccountsService:
     def get_accounts_state(self):
         return self.accounts_state
 
-    def get_default_market(self, token: str, connector_name: str) -> str:
+    def _market_components(self, token: str, connector_name: str) -> tuple[str, str]:
+        """Resolve the (base, quote) used to price a token on a connector.
+
+        Unwraps binance-earn staked tokens (LD-prefix) and picks the connector's native quote
+        (e.g. USDC on hyperliquid, USD on hyperliquid_perpetual), falling back to the global
+        default quote. This is the single source of truth for both ticker-pool lookups and the
+        exchange fallback fetch, so they always agree on base and quote.
+        """
         if token.startswith("LD") and token != "LDO":
             # These tokens are staked in binance earn
             token = token[2:]
         quote = self.default_quotes.get(connector_name, self.default_quote)
-        return f"{token}-{quote}"
+        return token, quote
+
+    def get_default_market(self, token: str, connector_name: str) -> str:
+        base, quote = self._market_components(token, connector_name)
+        return f"{base}-{quote}"
 
     def start(self):
         """
@@ -193,6 +211,12 @@ class AccountsService:
             except Exception as e:
                 logger.error(f"Error stopping Gateway transaction poller: {e}", exc_info=True)
 
+        # Close the GeckoTerminal price source HTTP client
+        try:
+            await self.gateway_wallet_service.close()
+        except Exception as e:
+            logger.error(f"Error closing Gateway wallet service: {e}", exc_info=True)
+
         # Stop all connectors through the connector service
         await self._connector_service.stop_all()
 
@@ -225,10 +249,17 @@ class AccountsService:
                 tasks = []
                 task_meta = []  # (account_name, connector_name)
 
+                gateway_meta = []  # (account_name, connector_name) of Gateway connectors
+
                 for account_name, connectors in all_connectors.items():
                     if account_name not in self.accounts_state:
                         self.accounts_state[account_name] = {}
                     for connector_name, connector in connectors.items():
+                        # Gateway connectors only track the tokens of their trading pairs; the
+                        # full wallet balance is fetched by _update_gateway_balances below.
+                        if self._connector_service.is_gateway_connector(connector):
+                            gateway_meta.append((account_name, connector_name))
+                            continue
                         tasks.append(self._refresh_and_get_tokens_info(connector, connector_name, account_name))
                         task_meta.append((account_name, connector_name))
 
@@ -248,6 +279,8 @@ class AccountsService:
                 gw_result = results[-1]
                 if isinstance(gw_result, Exception):
                     logger.error(f"Error updating gateway balances: {gw_result}")
+
+                self._mirror_gateway_state_to_accounts(gateway_meta)
 
                 await self.dump_account_state()
             except Exception as e:
@@ -382,6 +415,7 @@ class AccountsService:
         # Prepare parallel tasks
         tasks = []
         task_meta = []  # (account_name, connector_name)
+        gateway_meta = []  # (account_name, connector_name) of Gateway connectors
 
         for account_name, connectors in all_connectors.items():
             # Filter by account_names if specified
@@ -393,6 +427,13 @@ class AccountsService:
             for connector_name, connector in connectors.items():
                 # Filter by connector_names if specified
                 if connector_names and connector_name not in connector_names:
+                    continue
+
+                # Gateway connectors only track the tokens of their trading pairs; the full
+                # wallet balance is fetched by _update_gateway_balances below. Running both
+                # would overwrite the complete wallet state with the narrower connector view.
+                if self._connector_service.is_gateway_connector(connector):
+                    gateway_meta.append((account_name, connector_name))
                     continue
 
                 tasks.append(self._get_connector_tokens_info(connector, connector_name))
@@ -419,11 +460,32 @@ class AccountsService:
             else:
                 self.accounts_state[account_name][connector_name] = result
 
-    async def _get_connector_tokens_info(self, connector, connector_name: str, skip_balance_refresh: bool = False) -> List[Dict]:
-        """Get token info from a connector instance using RateOracle cached prices.
+        if not skip_gateway:
+            self._mirror_gateway_state_to_accounts(gateway_meta)
 
-        Fetches fresh balances from the exchange, then tries the RateOracle (instant, in-memory)
-        first for each token price. Only falls back to a batch exchange call for tokens the oracle can't price.
+    def _mirror_gateway_state_to_accounts(self, gateway_meta: List[tuple]):
+        """Mirror Gateway wallet balances onto non-master accounts holding the same connector.
+
+        _update_gateway_balances stores the full wallet balances under master_account. A
+        Gateway connector configured on another account trades the same Gateway default
+        wallet, so it reports the same balances.
+
+        Args:
+            gateway_meta: (account_name, connector_name) pairs of Gateway connectors.
+        """
+        master_state = self.accounts_state.get("master_account", {})
+        for account_name, connector_name in gateway_meta:
+            if account_name == "master_account":
+                continue
+            if connector_name in master_state:
+                self.accounts_state[account_name][connector_name] = master_state[connector_name]
+
+    async def _get_connector_tokens_info(self, connector, connector_name: str, skip_balance_refresh: bool = False) -> List[Dict]:
+        """Get token info from a connector instance using the ticker pool prices.
+
+        Fetches fresh balances from the exchange, then tries the ticker pool (instant, in-memory
+        cross-rate resolution) first for each token price. Only falls back to a batch exchange
+        call for tokens the pool can't price.
 
         Args:
             connector: The connector instance
@@ -449,13 +511,17 @@ class AccountsService:
             if "USD" in token:
                 price = Decimal("1")
             else:
-                # Try RateOracle first (instant, cached)
-                rate = self._market_data_service.get_rate(token, "USDT")
+                # Price using THIS connector's own tickers and its native quote (instant,
+                # in-memory cross-rate resolution). Using the connector's own quote avoids
+                # mismatches on exchanges that don't list the global quote (e.g. hyperliquid
+                # quotes in USDC/USD, not USDT).
+                base, quote = self._market_components(token, connector_name)
+                rate = self._market_data_service.get_rate_for_connector(connector_name, base, quote)
                 if rate and rate > 0:
                     price = rate
                 else:
                     # Queue for fallback batch fetch from exchange
-                    market = self.get_default_market(token, connector_name)
+                    market = f"{base}-{quote}"
                     missing_pairs.append(market)
                     missing_indices.append(len(tokens_info))
                     price = None  # resolved below
@@ -1080,6 +1146,11 @@ class AccountsService:
                 # A chain whose get_config raised is skipped/logged, same as before
                 if isinstance(config, Exception):
                     logger.warning(f"Could not get config for '{chain}-{first_network}': {config}")
+                    continue
+
+                # A Gateway HTTP error dict would otherwise read as "missing defaultWallet" below
+                if config is None or set(config.keys()) == {"error", "status"}:
+                    logger.warning(f"Gateway error getting config for '{chain}-{first_network}': {config}")
                     continue
 
                 default_wallet = config.get("defaultWallet")

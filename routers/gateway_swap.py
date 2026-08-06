@@ -1,23 +1,21 @@
 """
 Gateway Swap Router - Handles DEX swap operations via Hummingbot Gateway.
-Supports Router connectors (Jupiter, 0x) for token swaps.
+Uses Gateway's unified /trading/swap endpoints, so any swap provider works:
+router connectors (jupiter, 0x, uniswap, pancakeswap) and amm/clmm connectors
+(raydium/amm, meteora/clmm, ...).
 """
 import logging
-from typing import Optional
 from decimal import Decimal
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from deps import get_accounts_service, get_database_manager
-from services.accounts_service import AccountsService
 from database import AsyncDatabaseManager
 from database.repositories import GatewaySwapRepository
-from models import (
-    SwapQuoteRequest,
-    SwapQuoteResponse,
-    SwapExecuteRequest,
-    SwapExecuteResponse,
-)
+from deps import get_accounts_service, get_database_manager
+from models import SwapExecuteRequest, SwapExecuteResponse, SwapQuoteRequest, SwapQuoteResponse
+from services.accounts_service import AccountsService
+from services.gateway_client import GatewayError, check_gateway_error
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +50,10 @@ async def get_swap_quote(
     accounts_service: AccountsService = Depends(get_accounts_service)
 ):
     """
-    Get a price quote for a swap via router (Jupiter, 0x).
+    Get a price quote for a swap.
 
     Example:
-        connector: 'jupiter'
+        connector: 'jupiter' (or typed: 'jupiter/router', 'meteora/clmm', 'raydium/amm')
         network: 'solana-mainnet-beta'
         trading_pair: 'SOL-USDC'
         side: 'BUY'
@@ -69,23 +67,19 @@ async def get_swap_quote(
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
-
         # Parse trading pair
         base, quote = request.trading_pair.split("-")
 
         # Get quote from Gateway
-        result = await accounts_service.gateway_client.quote_swap(
+        result = check_gateway_error(await accounts_service.gateway_client.quote_swap(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             base_asset=base,
             quote_asset=quote,
             amount=float(request.amount),
             side=request.side,
-            slippage_pct=float(request.slippage_pct) if request.slippage_pct else 1.0,
-            pool_address=None
-        )
+            slippage_pct=float(request.slippage_pct) if request.slippage_pct is not None else 1.0
+        ))
 
         # Extract amounts from Gateway response (snake_case for consistency)
         amount_in_raw = result.get("amountIn") or result.get("amount_in")
@@ -106,12 +100,14 @@ async def get_swap_quote(
             amount_in=amount_in,
             amount_out=amount_out,
             expected_amount=amount_out,  # Deprecated, kept for backward compatibility
-            slippage_pct=request.slippage_pct or Decimal("1.0"),
+            slippage_pct=request.slippage_pct if request.slippage_pct is not None else Decimal("1.0"),
             gas_estimate=gas_estimate_value
         )
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting swap quote: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -144,7 +140,7 @@ async def execute_swap(
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        # Parse network_id
+        # Parse network_id (chain needed for wallet lookup)
         chain, network = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get wallet address
@@ -157,18 +153,16 @@ async def execute_swap(
         base, quote = request.trading_pair.split("-")
 
         # Execute swap
-        result = await accounts_service.gateway_client.execute_swap(
+        result = check_gateway_error(await accounts_service.gateway_client.execute_swap(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             wallet_address=wallet_address,
             base_asset=base,
             quote_asset=quote,
             amount=float(request.amount),
             side=request.side,
-            slippage_pct=float(request.slippage_pct) if request.slippage_pct else 1.0
-        )
-        if not result:
-            raise HTTPException(status_code=500, detail="Gateway service is not able to execute swap")
+            slippage_pct=float(request.slippage_pct) if request.slippage_pct is not None else 1.0
+        ))
         transaction_hash = result.get("signature") or result.get("txHash") or result.get("hash")
         if not transaction_hash:
             raise HTTPException(status_code=500, detail="No transaction hash returned from Gateway")
@@ -207,7 +201,7 @@ async def execute_swap(
                     "input_amount": float(input_amount),
                     "output_amount": float(output_amount),
                     "price": float(price),
-                    "slippage_pct": float(request.slippage_pct) if request.slippage_pct else 1.0,
+                    "slippage_pct": float(request.slippage_pct) if request.slippage_pct is not None else 1.0,
                     "status": tx_status,
                     "pool_address": result.get("poolAddress") or result.get("pool_address")
                 }
@@ -228,6 +222,8 @@ async def execute_swap(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error executing swap: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

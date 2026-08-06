@@ -55,6 +55,25 @@ class MarketDataSettings(BaseSettings):
         default=60.0,
         description="Maximum allowed WebSocket subscription update interval in seconds"
     )
+    ticker_update_interval: int = Field(
+        default=30,
+        description="How often to refresh tickers from connected exchanges in seconds"
+    )
+    ticker_max_age: int = Field(
+        default=60,
+        description="Max age of cached tickers before an on-demand request refetches them, in seconds"
+    )
+    ticker_subscription_ttl: int = Field(
+        default=600,
+        description="How long a ticker-only connector stays in the background refresh cycle "
+                    "after its last request, in seconds"
+    )
+    hyperliquid_hip3_interval: int = Field(
+        default=120,
+        description="How often to refresh Hyperliquid HIP-3 (builder-deployed perp dex) tickers, "
+                    "in seconds. These need one request per dex (~10 total), so they refresh on a "
+                    "slower cadence than the main perp dex. Set to 0 to exclude HIP-3 markets."
+    )
 
     model_config = SettingsConfigDict(env_prefix="MARKET_DATA_", extra="ignore")
 
@@ -128,8 +147,9 @@ class GatewaySettings(BaseSettings):
     """Gateway service configuration."""
 
     url: str = Field(
-        default="http://localhost:15888",
-        description="Gateway service URL (use 'http://gateway:15888' when running in Docker)"
+        default="https://localhost:15888",
+        description="Gateway service URL. The Gateway always runs secured (mTLS), so this must use "
+                    "the 'https' scheme (SEC-048); use 'https://gateway:15888' when running in Docker."
     )
 
     model_config = SettingsConfigDict(env_prefix="GATEWAY_", extra="ignore")
@@ -190,6 +210,26 @@ class AppSettings(BaseSettings):
     )
 
 
+class BacktestingSettings(BaseSettings):
+    """Backtest result retention.
+
+    A finished backtest is ~98% bulk arrays (processed_data, pnl_timeseries) and only a
+    few KB of metrics, so full payloads are archived to disk and only metrics stay
+    resident. Retention is therefore a count of results, not a memory budget.
+    """
+
+    max_results: int = Field(
+        default=100,
+        description="How many finished backtests to retain before the oldest are reaped"
+    )
+    results_path: str = Field(
+        default="bots/data/backtests",
+        description="Directory holding archived backtest payloads (inside the bots volume, so it survives redeploys)"
+    )
+
+    model_config = SettingsConfigDict(env_prefix="BACKTESTING_", extra="ignore")
+
+
 class Settings(BaseSettings):
     """Combined application settings."""
 
@@ -201,6 +241,7 @@ class Settings(BaseSettings):
     gateway: GatewaySettings = Field(default_factory=GatewaySettings)
     cors: CORSSettings = Field(default_factory=CORSSettings)
     app: AppSettings = Field(default_factory=AppSettings)
+    backtesting: BacktestingSettings = Field(default_factory=BacktestingSettings)
 
     # Direct banned_tokens field to handle env parsing
     banned_tokens: List[str] = Field(
@@ -214,5 +255,6 @@ class Settings(BaseSettings):
         env_prefix="",
         extra="ignore"
     )
+
 
 settings = Settings()

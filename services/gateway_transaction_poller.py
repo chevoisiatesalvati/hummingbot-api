@@ -299,6 +299,15 @@ class GatewayTransactionPoller:
                 logger.warning(f"Invalid response from Gateway for transaction {tx_hash} on {network_id}: {result}")
                 return None
 
+            # A Gateway HTTP error (the client's {"error", "status"} shape) is transient — treat it
+            # like "no response" rather than letting its 'error' key mark the transaction FAILED below.
+            if set(result.keys()) == {"error", "status"}:
+                logger.warning(
+                    f"Gateway HTTP error polling transaction {tx_hash} on {network_id} "
+                    f"(status {result['status']}): {result['error']}"
+                )
+                return None
+
             logger.debug(f"Polled transaction {tx_hash} on {network_id}: txStatus={result.get('txStatus')}")
 
             # Parse the response with defensive checks

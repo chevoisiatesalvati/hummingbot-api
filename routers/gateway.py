@@ -4,14 +4,9 @@ from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from deps import get_accounts_service, get_gateway_service
-from models import (
-    AddPoolRequest,
-    AddTokenRequest,
-    GatewayConfig,
-    GatewayStatus,
-    UpdateApiKeysRequest,
-)
+from models import AddPoolRequest, AddTokenRequest, GatewayConfig, GatewayStatus, UpdateApiKeysRequest
 from services.accounts_service import AccountsService
+from services.gateway_client import GatewayError, check_gateway_error
 from services.gateway_service import GatewayService
 
 router = APIRouter(tags=["Gateway"], prefix="/gateway")
@@ -171,11 +166,13 @@ async def list_connectors(accounts_service: AccountsService = Depends(get_accoun
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        result = await accounts_service.gateway_client._request("GET", "config/connectors")
+        result = check_gateway_error(await accounts_service.gateway_client.get_connectors())
         return normalize_gateway_response(result)
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error listing connectors: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing connectors: {str(e)}")
 
@@ -195,11 +192,13 @@ async def get_connector_config(
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        result = await accounts_service.gateway_client.get_config(connector_name)
+        result = check_gateway_error(await accounts_service.gateway_client.get_config(connector_name))
         return normalize_gateway_response(result)
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting connector config: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting connector config: {str(e)}")
 
@@ -227,7 +226,9 @@ async def update_connector_config(
         for path, value in config_updates.items():
             # Convert snake_case to camelCase if needed
             camel_path = snake_to_camel(path) if '_' in path else path
-            result = await accounts_service.gateway_client.update_config(connector_name, camel_path, value)
+            result = check_gateway_error(
+                await accounts_service.gateway_client.update_config(connector_name, camel_path, value)
+            )
             results.append(result)
 
         return {
@@ -240,6 +241,8 @@ async def update_connector_config(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error updating connector config: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating connector config: {str(e)}")
 
@@ -266,11 +269,12 @@ async def get_api_keys(accounts_service: AccountsService = Depends(get_accounts_
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        result = await accounts_service.gateway_client.get_api_keys()
-        return result
+        return check_gateway_error(await accounts_service.gateway_client.get_api_keys())
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting API keys: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting API keys: {str(e)}")
 
@@ -336,11 +340,12 @@ async def list_chains(accounts_service: AccountsService = Depends(get_accounts_s
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        result = await accounts_service.gateway_client.get_chains()
-        return result
+        return check_gateway_error(await accounts_service.gateway_client.get_chains())
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error listing chains: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing chains: {str(e)}")
 
@@ -368,7 +373,9 @@ async def list_pools_legacy(
         # This is a simple mapping - in production, you'd want to look this up
         chain = "solana" if connector_name in ["raydium", "meteora", "orca", "pancakeswap-sol"] else "ethereum"
 
-        pools = await accounts_service.gateway_client.get_pools(chain, network, connector=connector_name)
+        pools = check_gateway_error(
+            await accounts_service.gateway_client.get_pools(chain, network, connector=connector_name)
+        )
 
         if not pools:
             return []
@@ -379,6 +386,8 @@ async def list_pools_legacy(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting pools: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting pools: {str(e)}")
 
@@ -399,7 +408,7 @@ async def list_networks(accounts_service: AccountsService = Depends(get_accounts
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        chains_result = await accounts_service.gateway_client.get_chains()
+        chains_result = check_gateway_error(await accounts_service.gateway_client.get_chains())
 
         # Flatten chain-network combinations into network IDs
         networks = []
@@ -422,6 +431,8 @@ async def list_networks(accounts_service: AccountsService = Depends(get_accounts
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error listing networks: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing networks: {str(e)}")
 
@@ -443,11 +454,13 @@ async def get_network_config(
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        result = await accounts_service.gateway_client.get_config(network_id)
+        result = check_gateway_error(await accounts_service.gateway_client.get_config(network_id))
         return normalize_gateway_response(result)
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting network config: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting network config: {str(e)}")
 
@@ -477,7 +490,9 @@ async def update_network_config(
         for path, value in config_updates.items():
             # Convert snake_case to camelCase if needed
             camel_path = snake_to_camel(path) if '_' in path else path
-            result = await accounts_service.gateway_client.update_config(network_id, camel_path, value)
+            result = check_gateway_error(
+                await accounts_service.gateway_client.update_config(network_id, camel_path, value)
+            )
             results.append(result)
 
         return {
@@ -490,6 +505,8 @@ async def update_network_config(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error updating network config: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating network config: {str(e)}")
 
@@ -519,7 +536,7 @@ async def get_network_tokens(
             raise HTTPException(status_code=400, detail=f"Invalid network_id format: '{network_id}'. Use 'chain-network'")
 
         chain, network = parts
-        result = await accounts_service.gateway_client.get_tokens(chain, network)
+        result = check_gateway_error(await accounts_service.gateway_client.get_tokens(chain, network))
 
         # Apply search filter
         if search and "tokens" in result:
@@ -534,6 +551,8 @@ async def get_network_tokens(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting network tokens: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting network tokens: {str(e)}")
 
@@ -575,17 +594,14 @@ async def add_network_token(
         # Use symbol as name if name is not provided
         token_name = token_request.name if token_request.name else token_request.symbol
 
-        result = await accounts_service.gateway_client.add_token(
+        check_gateway_error(await accounts_service.gateway_client.add_token(
             chain=chain,
             network=network,
             address=token_request.address,
             symbol=token_request.symbol,
             name=token_name,
             decimals=token_request.decimals
-        )
-
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=f"Failed to add token: {result.get('error')}")
+        ))
 
         return {
             "success": True,
@@ -599,6 +615,8 @@ async def add_network_token(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Failed to add token: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding token: {str(e)}")
 
@@ -632,14 +650,11 @@ async def save_network_token(
 
         chain, network = parts
 
-        result = await accounts_service.gateway_client.save_token(
+        result = check_gateway_error(await accounts_service.gateway_client.save_token(
             chain=chain,
             network=network,
             token_address=token_address
-        )
-
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=f"Failed to save token: {result.get('error')}")
+        ))
 
         token_info = result.get("token", {})
         return {
@@ -656,6 +671,8 @@ async def save_network_token(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Failed to save token: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving token: {str(e)}")
 
@@ -688,14 +705,11 @@ async def delete_network_token(
 
         chain, network = parts
 
-        result = await accounts_service.gateway_client.delete_token(
+        check_gateway_error(await accounts_service.gateway_client.delete_token(
             chain=chain,
             network=network,
             token_address=token_address
-        )
-
-        if "error" in result:
-            raise HTTPException(status_code=400, detail=f"Failed to delete token: {result.get('error')}")
+        ))
 
         return {
             "success": True,
@@ -706,6 +720,8 @@ async def delete_network_token(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Failed to delete token: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting token: {str(e)}")
 
@@ -743,13 +759,13 @@ async def get_network_pools(
             raise HTTPException(status_code=400, detail=f"Invalid network_id format: '{network_id}'. Use 'chain-network'")
 
         chain, network = parts
-        pools = await accounts_service.gateway_client.get_pools(
+        pools = check_gateway_error(await accounts_service.gateway_client.get_pools(
             chain=chain,
             network=network,
             connector=connector,
             pool_type=pool_type,
             search=search
-        )
+        ))
 
         # Normalize each pool
         normalized_pools = [normalize_gateway_response(pool) for pool in pools] if pools else []
@@ -762,6 +778,8 @@ async def get_network_pools(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting network pools: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting network pools: {str(e)}")
 

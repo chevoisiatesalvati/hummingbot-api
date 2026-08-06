@@ -32,12 +32,12 @@ config_helpers.save_to_yml = patched_save_to_yml
 from fastapi import Depends, FastAPI, HTTPException, Request, status  # noqa: E402
 from fastapi.exceptions import RequestValidationError  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.middleware.gzip import GZipMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.security import HTTPBasic, HTTPBasicCredentials  # noqa: E402
 from hummingbot.client.config.client_config_map import GatewayConfigMap  # noqa: E402
 from hummingbot.client.config.config_crypt import ETHKeyFileSecretManger  # noqa: E402
 from hummingbot.core.gateway.gateway_http_client import GatewayHttpClient  # noqa: E402
-from hummingbot.core.rate_oracle.rate_oracle import RATE_ORACLE_SOURCES, RateOracle  # noqa: E402
 
 from config import settings, warn_if_insecure_security_defaults  # noqa: E402
 from database import AsyncDatabaseManager  # noqa: E402
@@ -55,7 +55,6 @@ from routers import (  # noqa: E402
     gateway_swap,
     market_data,
     portfolio,
-    rate_oracle,
     scripts,
     storage,
     system,
@@ -114,63 +113,70 @@ async def lifespan(app: FastAPI):
     # 1. Infrastructure Setup
     # =========================================================================
 
+    # Initialize the secrets manager and log the master account in BEFORE any Gateway
+    # client exists: hummingbot's GatewayHttpClient decrypts its mTLS client key with
+    # Security.secrets_manager.password, which stays None until a login. Logging in
+    # here (instead of lazily on first connector creation) means the status monitor's
+    # very first ping can never hit an uninitialized Security.
+    secrets_manager = ETHKeyFileSecretManger(password=settings.security.config_password)
+    if not BackendAPISecurity.login_account(account_name="master_account", secrets_manager=secrets_manager):
+        raise RuntimeError(
+            "CONFIG_PASSWORD does not match the stored password verification file at "
+            f"bots/{settings.app.password_verification_path}"
+        )
+
     # Initialize GatewayHttpClient singleton
+    from utils.gateway_certs import certs_present, sync_client_certs_to_root
     parsed_gateway_url = urlparse(settings.gateway.url)
+    gateway_use_ssl = parsed_gateway_url.scheme == "https"
+    if gateway_use_ssl:
+        # SEC-048: the in-process GatewayHttpClient reads its client certs only from
+        # root_path()/certs. Mirror the shared cert set there if the Gateway was already
+        # started in a previous run (no-op when certs haven't been generated yet).
+        sync_client_certs_to_root()
     gateway_config = GatewayConfigMap(
         gateway_api_host=parsed_gateway_url.hostname or "localhost",
         gateway_api_port=str(parsed_gateway_url.port or 15888),
-        gateway_use_ssl=parsed_gateway_url.scheme == "https"
+        gateway_use_ssl=gateway_use_ssl
     )
-    GatewayHttpClient.get_instance(gateway_config)
+    gateway_client = GatewayHttpClient.get_instance(gateway_config)
+    # Start the Gateway status monitor so Gateway's network connectors (e.g.
+    # 'solana-mainnet-beta', and any newly added chain like 'ethereum-unichain') are
+    # discovered from /config/chains and registered in AllConnectorSettings. Without
+    # it, a Gateway network only lands in AllConnectorSettings lazily, when a connector
+    # for it is first constructed; the monitor makes new chains enumerable without
+    # first deploying a bot on them, and picks them up when Gateway comes online later.
+    # On a fresh install the shared mTLS certs don't exist until the Gateway is first
+    # started, and every 2s ping would fail loudly building the SSL context — defer;
+    # GatewayService.start() starts the monitor once the certs are generated.
+    if not gateway_use_ssl or certs_present():
+        gateway_client.start_monitor()
+    else:
+        logging.info(
+            "Gateway mTLS certs not generated yet; status monitor deferred until the Gateway is started"
+        )
     logging.info(f"Initialized GatewayHttpClient with URL: {settings.gateway.url}")
 
-    # Initialize secrets manager and database
-    secrets_manager = ETHKeyFileSecretManger(password=settings.security.config_password)
+    # Initialize database
     db_manager = AsyncDatabaseManager(settings.database.url)
     await db_manager.create_tables()
     logging.info("Database initialized")
 
-    # Read rate oracle configuration from conf_client.yml
+    # Read the global quote token (the currency everything is valued in) from conf_client.yml.
+    # Prices come from our own ticker pool (MarketDataService), not the legacy RateOracle.
     from utils.file_system import FileSystemUtil
     fs_util = FileSystemUtil()
 
+    quote_token = "USDT"
     try:
         conf_client_path = "credentials/master_account/conf_client.yml"
         config_data = fs_util.read_yaml_file(conf_client_path)
-
-        # Get rate_oracle_source configuration
-        rate_oracle_source_data = config_data.get("rate_oracle_source", {})
-        source_name = rate_oracle_source_data.get("name", "gate_io")
-
-        # Get global_token configuration
-        global_token_data = config_data.get("global_token", {})
-        quote_token = global_token_data.get("global_token_name", "USDT")
-
-        # Create rate source instance
-        from routers.rate_oracle import create_rate_source
-        if source_name in RATE_ORACLE_SOURCES:
-            rate_source = create_rate_source(source_name)
-            logging.info(f"Configured RateOracle with source: {source_name}, quote_token: {quote_token}")
-        else:
-            logging.warning(f"Unknown rate oracle source '{source_name}', defaulting to gate_io")
-            rate_source = create_rate_source("gate_io")
-            source_name = "gate_io"
-
-        # Initialize RateOracle with configured source and quote token
-        rate_oracle = RateOracle.get_instance()
-        rate_oracle.source = rate_source
-        rate_oracle.quote_token = quote_token
-
+        quote_token = config_data.get("global_token", {}).get("global_token_name", "USDT")
+        logging.info(f"Configured global quote token: {quote_token}")
     except FileNotFoundError:
-        logging.warning("conf_client.yml not found, using default RateOracle configuration (gate_io, USDT)")
-        from routers.rate_oracle import create_rate_source
-        rate_oracle = RateOracle.get_instance()
-        rate_oracle.source = create_rate_source("gate_io")
+        logging.warning("conf_client.yml not found, defaulting global quote token to USDT")
     except Exception as e:
-        logging.warning(f"Error reading conf_client.yml: {e}, using default RateOracle configuration (gate_io)")
-        from routers.rate_oracle import create_rate_source
-        rate_oracle = RateOracle.get_instance()
-        rate_oracle.source = create_rate_source("gate_io")
+        logging.warning(f"Error reading conf_client.yml: {e}, defaulting global quote token to USDT")
 
     # =========================================================================
     # 2. UnifiedConnectorService - Single source of truth for all connectors
@@ -186,13 +192,19 @@ async def lifespan(app: FastAPI):
     # 3. Services that depend on connector_service
     # =========================================================================
 
-    # MarketDataService - candles, order books, prices
+    # MarketDataService - candles, order books, tickers, cross-rate pricing
     market_data_service = MarketDataService(
         connector_service=connector_service,
-        rate_oracle=rate_oracle,
+        quote_token=quote_token,
         cleanup_interval=settings.market_data.cleanup_interval,
-        feed_timeout=settings.market_data.feed_timeout
+        feed_timeout=settings.market_data.feed_timeout,
+        ticker_update_interval=settings.market_data.ticker_update_interval,
+        ticker_max_age=settings.market_data.ticker_max_age,
+        ticker_subscription_ttl=settings.market_data.ticker_subscription_ttl,
     )
+    # Connector trade-volume telemetry resolves rates through the ticker pool instead of the
+    # legacy RateOracle singleton.
+    connector_service.set_rate_provider(market_data_service)
     logging.info("MarketDataService initialized")
 
     # TradingService - order placement, positions, trading interfaces
@@ -246,6 +258,17 @@ async def lifespan(app: FastAPI):
     backtesting_service = BacktestingService()
     docker_service = DockerService()
     gateway_service = GatewayService()
+    # If a secured Gateway is already running but this API lost the shared mTLS certs (e.g. the
+    # API container was recreated without the persisted bots/ mount), regenerate the cert set and
+    # restart the Gateway so it loads a matching server cert. Non-fatal: the API must still boot
+    # even when Docker is unavailable or the Gateway is simply not running.
+    if gateway_use_ssl:
+        try:
+            reconcile = gateway_service.reconcile_certs()
+            if reconcile.get("action") != "none":
+                logging.info(f"Gateway cert reconciliation: {reconcile.get('message')}")
+        except Exception as e:
+            logging.warning(f"Gateway cert reconciliation skipped: {e}")
     bot_archiver = BotArchiver(
         settings.aws.api_key,
         settings.aws.secret_key,
@@ -273,7 +296,7 @@ async def lifespan(app: FastAPI):
 
     bots_orchestrator.start()
     market_data_service.start()
-    await market_data_service.warmup_rate_oracle()
+    await market_data_service.warmup_tickers()
     executor_service.start()
     accounts_service.start()
     executor_service.schedule_startup_recovery()
@@ -327,6 +350,7 @@ async def lifespan(app: FastAPI):
     await executor_service.stop()
     market_data_service.stop()
     await connector_service.stop_all()
+    GatewayHttpClient.get_instance().stop_monitor()
     docker_service.cleanup()
     await db_manager.close()
 
@@ -352,6 +376,10 @@ app.add_middleware(
     allow_methods=settings.cors.allow_methods,
     allow_headers=settings.cors.allow_headers,
 )
+
+# Compress responses for clients that send Accept-Encoding: gzip. These payloads are highly
+# repetitive JSON and compress ~14x; small responses are left alone via minimum_size.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 @app.exception_handler(RequestValidationError)
@@ -419,7 +447,6 @@ app.include_router(bot_orchestration.router, dependencies=[Depends(auth_user)])
 app.include_router(controllers.router, dependencies=[Depends(auth_user)])
 app.include_router(scripts.router, dependencies=[Depends(auth_user)])
 app.include_router(market_data.router, dependencies=[Depends(auth_user)])
-app.include_router(rate_oracle.router, dependencies=[Depends(auth_user)])
 app.include_router(backtesting.router, dependencies=[Depends(auth_user)])
 app.include_router(archived_bots.router, dependencies=[Depends(auth_user)])
 app.include_router(storage.router, dependencies=[Depends(auth_user)])

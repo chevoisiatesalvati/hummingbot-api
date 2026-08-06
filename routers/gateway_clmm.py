@@ -29,65 +29,11 @@ from models import (
     TimeBasedMetrics,
 )
 from services.accounts_service import AccountsService
+from services.gateway_client import GatewayError, check_gateway_error
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Gateway CLMM"], prefix="/gateway")
-
-
-async def fetch_pools_from_gateway(
-    gateway_url: str,
-    connector: str,
-    network: str = "mainnet-beta",
-    page: int = 0,
-    limit: int = 50,
-    query: Optional[str] = None,
-    sort_by: Optional[str] = None,
-    include_unverified: bool = True
-) -> Optional[dict]:
-    """
-    Fetch pools from Gateway's fetch-pools endpoint.
-
-    Args:
-        gateway_url: Gateway base URL (e.g., http://localhost:15888)
-        connector: Connector name (meteora, orca)
-        network: Network ID (default: mainnet-beta)
-        page: Page number (0-based)
-        limit: Results per page
-        query: Search query to match pools by name, tokens, or address
-        sort_by: Sort by field
-        include_unverified: Include pools with unverified tokens
-
-    Returns:
-        Dictionary with pools from Gateway, or None if failed
-    """
-    try:
-        url = f"{gateway_url}/connectors/{connector}/clmm/fetch-pools"
-        params = {
-            "network": network,
-            "limit": limit,
-        }
-
-        if page > 0:
-            params["page"] = page
-        if query:
-            params["query"] = query
-        if sort_by:
-            params["sortBy"] = sort_by
-        if not include_unverified:
-            params["includeUnverified"] = "false"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers={"accept": "application/json"}) as response:
-                response.raise_for_status()
-                data = await response.json()
-                return data
-    except aiohttp.ClientError as e:
-        logger.error(f"Failed to fetch pools from Gateway: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Error fetching pools from Gateway: {e}", exc_info=True)
-        return None
 
 
 async def fetch_raydium_pool_info(pool_address: str) -> Optional[dict]:
@@ -240,12 +186,14 @@ async def _refresh_position_data(position, accounts_service: AccountsService, cl
 
         # Get all positions for this pool and find our specific position
         try:
-            positions_list = await accounts_service.gateway_client.clmm_positions_owned(
+            # check_gateway_error is critical here: a Gateway HTTP error must raise (and skip
+            # the refresh) rather than flow onward and mark the position CLOSED below.
+            positions_list = check_gateway_error(await accounts_service.gateway_client.clmm_positions_owned(
                 connector=position.connector,
                 chain_network=position.network,  # position.network is already in 'chain-network' format
                 wallet_address=wallet_address,
                 pool_address=position.pool_address
-            )
+            ))
 
             # Find our specific position in the list
             result = None
@@ -371,18 +319,12 @@ async def get_clmm_pool_info(
         if not await accounts_service.gateway_client.ping():
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
-        # Parse network_id
-        chain, network_name = accounts_service.gateway_client.parse_network_id(network)
-
-        # Get pool info from Gateway using the CLMM-specific endpoint
-        result = await accounts_service.gateway_client.clmm_pool_info(
+        # Get pool info from Gateway's unified CLMM endpoint
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_pool_info(
             connector=connector,
-            network=network_name,
+            chain_network=network,
             pool_address=pool_address
-        )
-
-        if result is None:
-            raise HTTPException(status_code=503, detail="Failed to get pool info from Gateway")
+        ))
 
         # Parse the camelCase Gateway response into snake_case Pydantic model
         # The model's aliases will handle the conversion
@@ -390,6 +332,8 @@ async def get_clmm_pool_info(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting CLMM pool info: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -436,9 +380,6 @@ async def get_clmm_pools(
                 detail=f"Pool listing not supported for connector '{connector}'. Supported: {', '.join(supported_connectors)}"
             )
 
-        # Get Gateway URL from accounts service
-        gateway_url = accounts_service.gateway_base_url
-
         logger.info(f"Fetching pools from Gateway ({connector}, page={page}, limit={limit}, query={search_term})")
 
         # Build sort_by for Gateway (connector-specific format)
@@ -451,18 +392,15 @@ async def get_clmm_pools(
             else:  # orca
                 sort_by = sort_key
 
-        gateway_data = await fetch_pools_from_gateway(
-            gateway_url=gateway_url,
+        gateway_data = check_gateway_error(await accounts_service.gateway_client.clmm_fetch_pools(
             connector=connector.lower(),
+            network="mainnet-beta",
             page=page,
             limit=limit,
             query=search_term,
             sort_by=sort_by,
             include_unverified=include_unknown
-        )
-
-        if gateway_data is None:
-            raise HTTPException(status_code=503, detail=f"Failed to fetch pools from Gateway for {connector}")
+        ))
 
         # Transform Gateway response to our format
         # Both Meteora and Orca now return same format: {pools: [...], total, page, pageSize}
@@ -498,6 +436,8 @@ async def get_clmm_pools(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting CLMM pools: {e}")
     except Exception as e:
         logger.error(f"Error getting CLMM pools: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting CLMM pools: {str(e)}")
@@ -532,7 +472,7 @@ async def open_clmm_position(
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
         # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
+        chain, _ = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get wallet address
         wallet_address = await accounts_service.gateway_client.get_wallet_address_or_default(
@@ -540,12 +480,13 @@ async def open_clmm_position(
             wallet_address=request.wallet_address
         )
 
-        # Get pool info to extract trading pair for database
-        pool_info = await accounts_service.gateway_client.clmm_pool_info(
+        # Get pool info to extract trading pair for database. Fail loud on Gateway errors —
+        # opening a position without knowing its tokens would corrupt the position record.
+        pool_info = check_gateway_error(await accounts_service.gateway_client.clmm_pool_info(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             pool_address=request.pool_address
-        )
+        ))
 
         # Extract tokens from pool info
         base_token_address = pool_info.get("baseTokenAddress", "")
@@ -562,20 +503,18 @@ async def open_clmm_position(
         trading_pair = f"{base}-{quote}"
 
         # Open position
-        result = await accounts_service.gateway_client.clmm_open_position(
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_open_position(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             wallet_address=wallet_address,
             pool_address=request.pool_address,
             lower_price=float(request.lower_price),
             upper_price=float(request.upper_price),
             base_token_amount=float(request.base_token_amount) if request.base_token_amount else None,
             quote_token_amount=float(request.quote_token_amount) if request.quote_token_amount else None,
-            slippage_pct=float(request.slippage_pct) if request.slippage_pct else 1.0,
+            slippage_pct=float(request.slippage_pct) if request.slippage_pct is not None else 1.0,
             extra_params=request.extra_params
-        )
-        if not result:
-            raise HTTPException(status_code=404, detail=f"Failed to open CLMM position: {trading_pair}")
+        ))
 
         transaction_hash = result.get("signature") or result.get("txHash") or result.get("hash")
 
@@ -668,6 +607,8 @@ async def open_clmm_position(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error opening CLMM position: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -701,7 +642,7 @@ async def add_liquidity_to_clmm_position(
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
         # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
+        chain, _ = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get wallet address
         wallet_address = await accounts_service.gateway_client.get_wallet_address_or_default(
@@ -710,15 +651,15 @@ async def add_liquidity_to_clmm_position(
         )
 
         # Add liquidity to existing position
-        result = await accounts_service.gateway_client.clmm_add_liquidity(
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_add_liquidity(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             wallet_address=wallet_address,
             position_address=request.position_address,
             base_token_amount=float(request.base_token_amount) if request.base_token_amount else None,
             quote_token_amount=float(request.quote_token_amount) if request.quote_token_amount else None,
-            slippage_pct=float(request.slippage_pct) if request.slippage_pct else 1.0
-        )
+            slippage_pct=float(request.slippage_pct) if request.slippage_pct is not None else 1.0
+        ))
 
         transaction_hash = result.get("signature") or result.get("txHash") or result.get("hash")
         if not transaction_hash:
@@ -763,6 +704,8 @@ async def add_liquidity_to_clmm_position(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error adding liquidity: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -794,7 +737,7 @@ async def remove_liquidity_from_clmm_position(
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
         # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
+        chain, _ = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get wallet address
         wallet_address = await accounts_service.gateway_client.get_wallet_address_or_default(
@@ -803,13 +746,13 @@ async def remove_liquidity_from_clmm_position(
         )
 
         # Remove liquidity
-        result = await accounts_service.gateway_client.clmm_remove_liquidity(
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_remove_liquidity(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             wallet_address=wallet_address,
             position_address=request.position_address,
             percentage=float(request.percentage)
-        )
+        ))
 
         transaction_hash = result.get("signature") or result.get("txHash") or result.get("hash")
         if not transaction_hash:
@@ -854,6 +797,8 @@ async def remove_liquidity_from_clmm_position(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error removing liquidity: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -884,7 +829,7 @@ async def close_clmm_position(
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
         # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
+        chain, _ = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get pool_address and wallet_address from database
         pool_address = None
@@ -917,12 +862,12 @@ async def close_clmm_position(
         close_price = None
 
         try:
-            positions_list = await accounts_service.gateway_client.clmm_positions_owned(
+            positions_list = check_gateway_error(await accounts_service.gateway_client.clmm_positions_owned(
                 connector=request.connector,
                 chain_network=request.network,  # request.network is already in 'chain-network' format
                 wallet_address=wallet_address,
                 pool_address=pool_address
-            )
+            ))
 
             # Find our specific position and get pending fees and current price
             if positions_list and isinstance(positions_list, list):
@@ -939,12 +884,12 @@ async def close_clmm_position(
             logger.warning(f"Could not fetch position state before closing: {e}", exc_info=True)
 
         # Close position
-        result = await accounts_service.gateway_client.clmm_close_position(
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_close_position(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             wallet_address=wallet_address,
             position_address=request.position_address
-        )
+        ))
 
         transaction_hash = result.get("signature") or result.get("txHash") or result.get("hash")
         if not transaction_hash:
@@ -1053,6 +998,8 @@ async def close_clmm_position(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error closing CLMM position: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1083,7 +1030,7 @@ async def collect_fees_from_clmm_position(
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
         # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
+        chain, _ = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get pool_address and wallet_address from database
         pool_address = None
@@ -1115,12 +1062,12 @@ async def collect_fees_from_clmm_position(
         quote_fee_to_collect = Decimal("0")
 
         try:
-            positions_list = await accounts_service.gateway_client.clmm_positions_owned(
+            positions_list = check_gateway_error(await accounts_service.gateway_client.clmm_positions_owned(
                 connector=request.connector,
                 chain_network=request.network,  # request.network is already in 'chain-network' format
                 wallet_address=wallet_address,
                 pool_address=pool_address
-            )
+            ))
 
             # Find our specific position and get pending fees
             if positions_list and isinstance(positions_list, list):
@@ -1136,15 +1083,12 @@ async def collect_fees_from_clmm_position(
             logger.warning(f"Could not fetch pending fees before collection: {e}", exc_info=True)
 
         # Collect fees
-        result = await accounts_service.gateway_client.clmm_collect_fees(
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_collect_fees(
             connector=request.connector,
-            network=network,
+            chain_network=request.network,
             wallet_address=wallet_address,
             position_address=request.position_address
-        )
-
-        if not result:
-            raise HTTPException(status_code=500, detail="No response from Gateway collect-fees endpoint")
+        ))
 
         transaction_hash = result.get("signature") or result.get("txHash") or result.get("hash")
         if not transaction_hash:
@@ -1215,6 +1159,8 @@ async def collect_fees_from_clmm_position(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error collecting fees: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1244,7 +1190,7 @@ async def get_clmm_positions_owned(
             raise HTTPException(status_code=503, detail="Gateway service is not available")
 
         # Parse network_id
-        chain, network = accounts_service.gateway_client.parse_network_id(request.network)
+        chain, _ = accounts_service.gateway_client.parse_network_id(request.network)
 
         # Get wallet address
         wallet_address = await accounts_service.gateway_client.get_wallet_address_or_default(
@@ -1253,15 +1199,12 @@ async def get_clmm_positions_owned(
         )
 
         # Get positions for the specified pool
-        result = await accounts_service.gateway_client.clmm_positions_owned(
+        result = check_gateway_error(await accounts_service.gateway_client.clmm_positions_owned(
             connector=request.connector,
             chain_network=request.network,  # request.network is already in 'chain-network' format
             wallet_address=wallet_address,
             pool_address=request.pool_address
-        )
-
-        if result is None:
-            raise HTTPException(status_code=500, detail="Failed to get positions from Gateway")
+        ))
 
         # Gateway returns a list directly
         positions_data = result if isinstance(result, list) else []
@@ -1308,6 +1251,8 @@ async def get_clmm_positions_owned(
 
     except HTTPException:
         raise
+    except GatewayError as e:
+        raise HTTPException(status_code=e.status, detail=f"Gateway error getting CLMM positions owned: {e}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -95,3 +95,64 @@ class TestBalanceRefresh:
         assert len(result) == 1
         assert result[0]["token"] == "USDT"
         assert result[0]["units"] == 500.0
+
+
+class TestGatewayWalletState:
+    """Gateway wallet balances must not be overwritten by the Gateway connector's own view."""
+
+    @pytest.fixture
+    def accounts_service(self):
+        from services.accounts_service import AccountsService
+
+        service = AccountsService.__new__(AccountsService)
+        service.accounts_state = {}
+        service._connector_service = MagicMock()
+        return service
+
+    @pytest.mark.asyncio
+    async def test_gateway_connector_does_not_overwrite_wallet_balances(self, accounts_service):
+        """A Gateway connector must not replace the full wallet balances with its own tokens."""
+        wallet_balances = [
+            {"token": "SOL", "units": 0.35, "price": 0.0, "value": 0.0, "available_units": 0.35},
+            {"token": "USDC", "units": 1.31, "price": 1.0, "value": 1.31, "available_units": 1.31},
+            {"token": "TRUMP", "units": 0.15, "price": 0.0, "value": 0.0, "available_units": 0.15},
+        ]
+
+        gateway_connector = MagicMock()
+        accounts_service._connector_service.get_all_trading_connectors.return_value = {
+            "master_account": {"solana-mainnet-beta": gateway_connector}
+        }
+        accounts_service._connector_service.is_gateway_connector.return_value = True
+
+        async def fake_gateway_update(chain_networks=None):
+            accounts_service.accounts_state["master_account"]["solana-mainnet-beta"] = wallet_balances
+
+        accounts_service._update_gateway_balances = fake_gateway_update
+        accounts_service._get_connector_tokens_info = AsyncMock(
+            return_value=[{"token": "SOL", "units": 0.35}]
+        )
+
+        await accounts_service.update_account_state(connector_names=["solana-mainnet-beta"])
+
+        accounts_service._get_connector_tokens_info.assert_not_called()
+        assert accounts_service.accounts_state["master_account"]["solana-mainnet-beta"] == wallet_balances
+
+    @pytest.mark.asyncio
+    async def test_gateway_state_mirrored_to_other_accounts(self, accounts_service):
+        """Non-master accounts with a Gateway connector get the same wallet balances."""
+        wallet_balances = [{"token": "TRUMP", "units": 0.15, "price": 0.0, "value": 0.0}]
+
+        accounts_service._connector_service.get_all_trading_connectors.return_value = {
+            "trader_account": {"solana-mainnet-beta": MagicMock()}
+        }
+        accounts_service._connector_service.is_gateway_connector.return_value = True
+
+        async def fake_gateway_update(chain_networks=None):
+            accounts_service.accounts_state.setdefault("master_account", {})
+            accounts_service.accounts_state["master_account"]["solana-mainnet-beta"] = wallet_balances
+
+        accounts_service._update_gateway_balances = fake_gateway_update
+
+        await accounts_service.update_account_state()
+
+        assert accounts_service.accounts_state["trader_account"]["solana-mainnet-beta"] == wallet_balances

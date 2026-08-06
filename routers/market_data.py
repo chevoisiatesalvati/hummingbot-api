@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import time
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory, UnsupportedConnectorException
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig, HistoricalCandlesConfig
 
@@ -16,18 +17,26 @@ from models import (
     OrderBookQueryResult,
     OrderBookRequest,
     OrderBookResponse,
+    PoolPricesResponse,
     PriceForQuoteVolumeRequest,
     PriceForVolumeRequest,
     PriceRequest,
     PricesResponse,
     QuoteVolumeForPriceRequest,
+    RateRequest,
+    RatesResponse,
     RemoveTradingPairRequest,
+    SingleRateResponse,
+    TickerInfo,
+    TickersResponse,
     TradingPairResponse,
     VolumeForPriceRequest,
     VWAPForVolumeRequest,
 )
 from models.market_data import CandlesConfigRequest
 from services.market_data_service import MarketDataService
+from services.ticker_sources import TickerFetchError, TickerUnsupportedError
+from services.unified_connector_service import UnknownConnectorError
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +289,156 @@ async def get_prices(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching prices: {str(e)}")
+
+
+# ==================== Tickers & cross-rates ====================
+
+def _tickers_to_info(tickers) -> dict:
+    """Convert {pair: Ticker} to {pair: TickerInfo}."""
+    return {pair: TickerInfo(**t.to_dict()) for pair, t in tickers.items()}
+
+
+def _requested_connectors(connectors: Optional[List[str]]) -> List[str]:
+    """Parse the connector filter, accepting both ?connectors=a,b and ?connectors=a&connectors=b."""
+    names = []
+    for value in connectors or []:
+        names.extend(part.strip() for part in value.split(","))
+    return list(dict.fromkeys(n for n in names if n))  # de-duplicated, order preserved
+
+
+def _build_tickers_response(
+        tickers_by_connector: dict,
+        errors: dict,
+        market_data_manager: MarketDataService,
+) -> TickersResponse:
+    grouped = {name: _tickers_to_info(t) for name, t in tickers_by_connector.items()}
+    return TickersResponse(
+        tickers=grouped,
+        counts={name: len(t) for name, t in grouped.items()},
+        updated_at={
+            name: market_data_manager.ticker_updated_at(name) for name in grouped
+        },
+        errors={name: str(exc) for name, exc in errors.items()},
+    )
+
+
+@router.get("/tickers", response_model=TickersResponse)
+async def get_tickers(
+        connectors: Optional[List[str]] = Query(
+            None,
+            description="Restrict to these connectors. Accepts a comma-separated list or the "
+                        "parameter repeated. Omit to return the whole collected pool."
+        ),
+        refresh: bool = Query(False, description="Force a fresh fetch, ignoring the cache"),
+        max_age: Optional[float] = Query(
+            None, ge=0, description="Accept cached tickers up to this age in seconds"
+        ),
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """
+    Get tickers grouped by connector, with 24h base and quote volume where available.
+
+    Without ``connectors`` this returns the collected pool as-is. Naming connectors fetches
+    them on demand (concurrently) through keyless public data connectors when the cache is
+    missing or stale, so it works for exchanges no API keys are configured for; those
+    connectors then join the background refresh cycle.
+
+    A connector that fails does not remove the others from the response: it is reported under
+    ``errors`` alongside the successful results. An error status is returned only when nothing
+    could be served at all.
+    """
+    names = _requested_connectors(connectors)
+
+    # No filter and no refresh: a plain read of the pool, no requests made.
+    if not names and not refresh:
+        return _build_tickers_response(market_data_manager.get_tickers(), {}, market_data_manager)
+
+    targets = names or market_data_manager.collected_connector_names()
+    if not targets:
+        return _build_tickers_response({}, {}, market_data_manager)
+
+    try:
+        tickers, errors = await market_data_manager.fetch_tickers_for(
+            targets, max_age=max_age, force=refresh
+        )
+    except UnknownConnectorError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # Everything requested failed, so report why instead of an empty, seemingly-fine 200.
+    if errors and not tickers:
+        detail = "; ".join(f"{name}: {exc}" for name, exc in sorted(errors.items()))
+        if all(isinstance(exc, TickerUnsupportedError) for exc in errors.values()):
+            # Known connectors that can never serve public tickers; retrying will not help.
+            raise HTTPException(status_code=400, detail=detail)
+        if all(isinstance(exc, TickerFetchError) for exc in errors.values()):
+            raise HTTPException(status_code=502, detail=f"Failed to fetch tickers: {detail}")
+        logger.error(f"Unexpected error fetching tickers for {targets}: {detail}")
+        raise HTTPException(status_code=500, detail=detail)
+
+    return _build_tickers_response(tickers, errors, market_data_manager)
+
+
+@router.post("/rates", response_model=RatesResponse)
+async def get_rates(
+        request: RateRequest,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """
+    Resolve cross-rates for trading pairs from the collected ticker pool.
+
+    Rates are resolved via direct, reverse or bridged paths. When ``connector`` is set, only
+    that exchange's tickers are used; otherwise the merged multi-exchange pool is used.
+    """
+    rates = {}
+    for pair in request.trading_pairs:
+        if request.connector:
+            base, quote = pair.split("-") if "-" in pair else (pair, None)
+            rate = market_data_manager.get_rate_for_connector(request.connector, base, quote) if quote else None
+        else:
+            rate = market_data_manager.get_pair_rate(pair)
+        rates[pair] = float(rate) if rate else None
+    return RatesResponse(
+        quote_token=market_data_manager.quote_token,
+        connector=request.connector,
+        rates=rates,
+    )
+
+
+@router.get("/rate/{trading_pair}", response_model=SingleRateResponse)
+async def get_single_rate(
+        trading_pair: str,
+        connector: str = None,
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """
+    Resolve a cross-rate for a single ``BASE-QUOTE`` trading pair from the ticker pool.
+
+    Pass ``?connector=<name>`` to restrict resolution to a single exchange's tickers.
+    """
+    if connector:
+        base, quote = trading_pair.split("-") if "-" in trading_pair else (trading_pair, None)
+        rate = market_data_manager.get_rate_for_connector(connector, base, quote) if quote else None
+    else:
+        rate = market_data_manager.get_pair_rate(trading_pair)
+    return SingleRateResponse(
+        trading_pair=trading_pair,
+        rate=float(rate) if rate else None,
+        quote_token=market_data_manager.quote_token,
+        connector=connector,
+    )
+
+
+@router.get("/pool-prices", response_model=PoolPricesResponse)
+async def get_pool_prices(
+        market_data_manager: MarketDataService = Depends(get_market_data_service)
+):
+    """Get a snapshot of the merged price pool used for cross-rate resolution."""
+    prices = {pair: float(price) for pair, price in market_data_manager.prices.items()}
+    return PoolPricesResponse(
+        quote_token=market_data_manager.quote_token,
+        prices_count=len(prices),
+        prices=prices,
+    )
 
 
 @router.post("/funding-info", response_model=FundingInfoResponse)

@@ -1,5 +1,4 @@
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -191,3 +190,71 @@ class TradingPairResponse(BaseModel):
     connector_name: str = Field(description="Name of the connector")
     trading_pair: str = Field(description="Trading pair that was added/removed")
     message: str = Field(description="Status message")
+
+
+# Ticker & cross-rate models (in-house ticker pool, replaces the rate oracle endpoints)
+
+class TickerInfo(BaseModel):
+    """A single collected ticker."""
+    price: float = Field(description="Mid price (or last price when bid/ask unavailable)")
+    base_volume: Optional[float] = Field(
+        default=None, description="24h volume denominated in the base asset"
+    )
+    quote_volume: Optional[float] = Field(
+        default=None, description="24h volume denominated in the quote asset"
+    )
+    timestamp: float = Field(description="Collection timestamp")
+
+
+class TickersResponse(BaseModel):
+    """Tickers grouped by connector."""
+    tickers: Dict[str, Dict[str, TickerInfo]] = Field(
+        description="Connector to {trading pair: ticker} mapping"
+    )
+    counts: Dict[str, int] = Field(
+        default_factory=dict, description="Number of tickers per connector"
+    )
+    updated_at: Dict[str, Optional[float]] = Field(
+        default_factory=dict,
+        description="Unix timestamp of the last successful fetch, per connector"
+    )
+    errors: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Connectors that could not be fetched, with the reason. Present only when "
+                    "some requested connectors succeeded and others failed"
+    )
+
+
+class RateRequest(BaseModel):
+    """Request for cross-rates from the ticker pool."""
+    trading_pairs: List[str] = Field(
+        description="Trading pairs to price (e.g., ['BTC-USDT', 'ETH-USDT'])"
+    )
+    connector: Optional[str] = Field(
+        default=None,
+        description="If set, resolve rates using only this connector's tickers"
+    )
+
+
+class RatesResponse(BaseModel):
+    """Cross-rates for the requested trading pairs."""
+    quote_token: str = Field(description="Configured global quote token")
+    connector: Optional[str] = Field(default=None, description="Connector used, if scoped")
+    rates: Dict[str, Optional[float]] = Field(
+        description="Trading pair to rate mapping (None if not resolvable)"
+    )
+
+
+class SingleRateResponse(BaseModel):
+    """Cross-rate for a single trading pair."""
+    trading_pair: str = Field(description="The trading pair")
+    rate: Optional[float] = Field(description="The resolved rate (None if not found)")
+    quote_token: str = Field(description="Configured global quote token")
+    connector: Optional[str] = Field(default=None, description="Connector used, if scoped")
+
+
+class PoolPricesResponse(BaseModel):
+    """Snapshot of the merged price pool used for cross-rate resolution."""
+    quote_token: str = Field(description="Configured global quote token")
+    prices_count: int = Field(description="Number of prices in the pool")
+    prices: Dict[str, float] = Field(description="Trading pair to price mapping")

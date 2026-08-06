@@ -41,6 +41,162 @@ from utils.executor_log_capture import ExecutorLogCapture, current_executor_id
 
 logger = logging.getLogger(__name__)
 
+# #region agent log
+# Dual-write: prior session c80b00 + current passive session e46493.
+_DEBUG_LOG_PATHS = (
+    "/home/saul/projects/Hummingbot/.cursor/debug-c80b00.log",
+    "/home/saul/projects/Hummingbot/condor/.cursor/debug-e46493.log",
+)
+_STOP_LOSS_DEBUG_HOOK_INSTALLED = False
+
+
+def _agent_debug_log(location: str, message: str, hypothesis_id: str, data: Dict[str, Any]) -> None:
+    try:
+        line = json.dumps(
+            {
+                "sessionId": "e46493",
+                "runId": "live-passive",
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "timestamp": int(time.time() * 1000),
+                "data": data,
+            },
+            default=str,
+        ) + "\n"
+        for path in _DEBUG_LOG_PATHS:
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _install_position_executor_stop_loss_debug_hook() -> None:
+    """Wrap PositionExecutor.control_stop_loss to snapshot bid/ask/mid at trigger time.
+
+    Triple-barrier logic lives in the pip hummingbot package, but executors run
+    in-process inside hummingbot-api — so this monkey-patch catches live SL fires
+    without editing Condor or rebuilding the hummingbot wheel.
+    """
+    global _STOP_LOSS_DEBUG_HOOK_INSTALLED
+    if _STOP_LOSS_DEBUG_HOOK_INSTALLED:
+        return
+    try:
+        from hummingbot.core.data_type.common import PriceType, TradeType
+    except Exception:
+        return
+
+    _orig = PositionExecutor.control_stop_loss
+    pe_file = getattr(PositionExecutor, "__module__", None)
+    try:
+        import inspect
+
+        pe_path = inspect.getfile(PositionExecutor)
+    except Exception:
+        pe_path = None
+
+    def _control_stop_loss_with_debug(self):
+        tbc = self.config.triple_barrier_config
+        if tbc.stop_loss and self.net_pnl_pct <= -tbc.stop_loss:
+            ghost_suspect = False
+            try:
+                conn = self.config.connector_name
+                pair = self.config.trading_pair
+                bid = float(self.get_price(conn, pair, PriceType.BestBid))
+                ask = float(self.get_price(conn, pair, PriceType.BestAsk))
+                mid = float(self.get_price(conn, pair, PriceType.MidPrice))
+                entry = float(self.entry_price)
+                mark = float(self.close_price)
+                pnl_pct = float(self.net_pnl_pct)
+                sl = float(tbc.stop_loss)
+                tp = float(tbc.take_profit) if tbc.take_profit else None
+                side = self.config.side
+                side_name = side.name if hasattr(side, "name") else str(side)
+                mid_move = ((mid - entry) / entry) if entry else None
+                bid_move = ((bid - entry) / entry) if entry else None
+                ask_move = ((ask - entry) / entry) if entry else None
+                mark_move = ((mark - entry) / entry) if entry else None
+                if side == TradeType.BUY:
+                    # Long SL mark uses BestBid (see PositionExecutor.current_market_price).
+                    adverse_move = bid_move
+                    would_fire_on_mid = (mid_move is not None) and (mid_move <= -sl)
+                    would_fire_on_adverse = (bid_move is not None) and (bid_move <= -sl)
+                    ghost_suspect = bool(would_fire_on_adverse and would_fire_on_mid is False)
+                    mark_price_type = "BestBid"
+                else:
+                    # Short SL mark uses BestAsk.
+                    adverse_move = ((entry - ask) / entry) if entry and ask is not None else None
+                    mid_adverse = ((entry - mid) / entry) if entry and mid is not None else None
+                    would_fire_on_mid = (mid_adverse is not None) and (mid_adverse <= -sl)
+                    would_fire_on_adverse = (adverse_move is not None) and (adverse_move <= -sl)
+                    ghost_suspect = bool(would_fire_on_adverse and would_fire_on_mid is False)
+                    mark_price_type = "BestAsk"
+                _agent_debug_log(
+                    "executor_service.py:control_stop_loss_hook",
+                    "STOP_LOSS blocked by mid sanity gate"
+                    if ghost_suspect
+                    else "STOP_LOSS trigger mark snapshot",
+                    "B-bestbid-ghost" if ghost_suspect else "B-sl-allowed",
+                    {
+                        "executor_id": str(self.config.id),
+                        "pair": pair,
+                        "side": side_name,
+                        "entry_price": entry,
+                        "mark_close_price": mark,
+                        "mark_price_type": mark_price_type,
+                        "best_bid": bid,
+                        "best_ask": ask,
+                        "mid_price": mid,
+                        "spread_pct": ((ask - bid) / mid) if mid else None,
+                        "bid_mid_gap_pct": ((bid - mid) / mid) if mid else None,
+                        "ask_mid_gap_pct": ((ask - mid) / mid) if mid else None,
+                        "net_pnl_pct": pnl_pct,
+                        "stop_loss": sl,
+                        "take_profit": tp,
+                        "mark_move_vs_entry_pct": mark_move,
+                        "mid_move_vs_entry_pct": mid_move,
+                        "bid_move_vs_entry_pct": bid_move,
+                        "ask_move_vs_entry_pct": ask_move,
+                        "adverse_move_vs_entry_pct": adverse_move,
+                        "sl_would_fire_on_mid": would_fire_on_mid,
+                        "sl_would_fire_on_adverse": would_fire_on_adverse,
+                        "ghost_bid_suspect": bool(side == TradeType.BUY and ghost_suspect),
+                        "ghost_ask_suspect": bool(side == TradeType.SELL and ghost_suspect),
+                        "ghost_mark_suspect": ghost_suspect,
+                        "sanity_gate_blocked": ghost_suspect,
+                        "runId_tag": "post-fix",
+                    },
+                )
+            except Exception as e:
+                logger.debug("SL debug hook failed: %s", e)
+            # Enforce mid confirmation even if PositionExecutor was not reloaded.
+            if ghost_suspect:
+                return
+        return _orig(self)
+
+    PositionExecutor.control_stop_loss = _control_stop_loss_with_debug  # type: ignore[method-assign]
+    _STOP_LOSS_DEBUG_HOOK_INSTALLED = True
+    _agent_debug_log(
+        "executor_service.py:_install_hook",
+        "Installed PositionExecutor.stop_loss debug hook + mid sanity gate",
+        "boot",
+        {
+            "position_executor_module": pe_file,
+            "position_executor_file": pe_path,
+            "log_paths": list(_DEBUG_LOG_PATHS),
+            "sanity_gate": "mid_must_confirm_sl",
+            "runId_tag": "post-fix",
+        },
+    )
+    logger.info(
+        "Installed PositionExecutor.stop_loss mid sanity gate (sessions c80b00+e46493; pe=%s)",
+        pe_path,
+    )
+# #endregion
+
 
 def _json_default(obj):
     """JSON serializer for objects not serializable by default."""
@@ -177,6 +333,10 @@ class ExecutorService:
         self._recovery_in_progress = False
         # Executors waiting for their initial DB insert (control loop must not complete them yet).
         self._executors_pending_creation_persist: set[str] = set()
+
+        # #region agent log
+        _install_position_executor_stop_loss_debug_hook()
+        # #endregion
         # Cached HL userFills keyed by (account, connector); avoids 429 bursts on executor search.
         self._hl_fills_cache: Dict[tuple[str, str], tuple[float, Dict[str, List[Dict[str, Any]]]]] = {}
         self._hl_fills_cache_ttl_seconds = 300.0
@@ -2493,6 +2653,56 @@ class ExecutorService:
 
         return executor_id, executor
 
+    @staticmethod
+    def controller_id_from_config(config: Any) -> Optional[str]:
+        """Return non-empty controller_id embedded in an executor config dict."""
+        if not isinstance(config, dict):
+            return None
+        cid = config.get("controller_id")
+        if cid is None:
+            return None
+        text = str(cid).strip()
+        return text or None
+
+    @classmethod
+    def resolve_controller_id(
+        cls,
+        explicit: Optional[str],
+        *,
+        config: Optional[Dict[str, Any]] = None,
+        typed_config: Any = None,
+    ) -> str:
+        """Resolve ownership tag for create/search.
+
+        Prefer an explicit non-default id. Otherwise use config.controller_id
+        (where Condor/agents set it), then typed-config, then ``main``.
+        """
+        explicit_text = str(explicit).strip() if explicit is not None else ""
+        if explicit_text and explicit_text != "main":
+            return explicit_text
+
+        from_config = cls.controller_id_from_config(config)
+        if from_config:
+            return from_config
+
+        typed = getattr(typed_config, "controller_id", None) if typed_config is not None else None
+        if typed is not None:
+            typed_text = str(typed).strip()
+            if typed_text:
+                return typed_text
+
+        return explicit_text or "main"
+
+    @classmethod
+    def effective_controller_id(
+        cls,
+        *,
+        top_level: Optional[str] = None,
+        config: Any = None,
+    ) -> str:
+        """Controller id used for search/display, including legacy rows tagged main."""
+        return cls.resolve_controller_id(top_level, config=config if isinstance(config, dict) else None)
+
     async def create_executor(
         self,
         executor_config: Dict[str, Any],
@@ -2525,8 +2735,16 @@ class ExecutorService:
         if executor_type == "position_executor":
             await self._validate_position_executor_order_size(account, executor_config)
 
-        # Instantiate the executor, register it in memory and start it
-        controller_id = controller_id or getattr(typed_config, "controller_id", "main") or "main"
+        # Instantiate the executor, register it in memory and start it.
+        # Prefer an explicit non-default controller_id; otherwise take it from
+        # executor_config (Condor/agents put it there) before falling back to "main".
+        # CreateExecutorRequest historically defaulted controller_id="main", which
+        # masked config.controller_id via `explicit or ...` short-circuit.
+        controller_id = self.resolve_controller_id(
+            controller_id,
+            config=executor_config,
+            typed_config=typed_config,
+        )
         metadata = {
             "account_name": account,
             "connector_name": connector_name,
@@ -2611,7 +2829,11 @@ class ExecutorService:
                 continue
             if status and executor.status.name != status:
                 continue
-            if controller_id and metadata.get("controller_id", "main") != controller_id:
+            effective_cid = self.effective_controller_id(
+                top_level=metadata.get("controller_id"),
+                config=metadata.get("config"),
+            )
+            if controller_id and effective_cid != controller_id:
                 continue
 
             result.append(self._format_executor_info(executor_id, executor))
@@ -2622,6 +2844,9 @@ class ExecutorService:
                 async with self.db_manager.get_session_context() as session:
                     repo = ExecutorRepository(session)
 
+                    # Legacy rows may still have column controller_id="main" while
+                    # the real owner lives in config JSON. Pull both and filter by
+                    # effective id after formatting.
                     db_executors = await repo.get_executors(
                         account_name=account_name,
                         connector_name=connector_name,
@@ -2631,6 +2856,20 @@ class ExecutorService:
                         controller_id=controller_id,
                         limit=limit
                     )
+                    if controller_id and controller_id != "main":
+                        legacy_main = await repo.get_executors(
+                            account_name=account_name,
+                            connector_name=connector_name,
+                            trading_pair=trading_pair,
+                            executor_type=executor_type,
+                            status=status,
+                            controller_id="main",
+                            limit=limit,
+                        )
+                        seen = {r.executor_id for r in db_executors}
+                        db_executors = list(db_executors) + [
+                            r for r in legacy_main if r.executor_id not in seen
+                        ]
 
                 repair_candidates = [
                     r for r in db_executors if self._executor_may_need_hl_pnl_repair(r)
@@ -2651,6 +2890,11 @@ class ExecutorService:
                     if record.status == "RUNNING":
                         continue
                     formatted = self._format_db_record(record)
+                    if (
+                        controller_id
+                        and formatted.get("controller_id") != controller_id
+                    ):
+                        continue
                     if fills_by_oid and self._executor_may_need_hl_pnl_repair(record):
                         formatted = await self._repair_executor_pnl_from_hl_fills(
                             formatted, record, fills_by_oid
@@ -2782,6 +3026,71 @@ class ExecutorService:
         # Persist final state to database
         await self._persist_executor_completed(executor_id, executor)
 
+        # #region agent log
+        try:
+            close_type_name = executor.close_type.name if executor.close_type else None
+            if close_type_name == "STOP_LOSS" and isinstance(executor, PositionExecutor):
+                from hummingbot.core.data_type.common import PriceType
+
+                entry = float(executor.entry_price)
+                close_px = float(executor.close_price)
+                pnl_q = float(executor.net_pnl_quote)
+                pnl_pct = float(executor.net_pnl_pct)
+                tbc = executor.config.triple_barrier_config
+                sl = float(tbc.stop_loss or 0)
+                tp = float(tbc.take_profit) if tbc.take_profit else None
+                side = executor.config.side
+                side_name = side.name if hasattr(side, "name") else str(side)
+                bid = ask = mid = None
+                try:
+                    conn = executor.config.connector_name
+                    pair = executor.config.trading_pair
+                    bid = float(executor.get_price(conn, pair, PriceType.BestBid))
+                    ask = float(executor.get_price(conn, pair, PriceType.BestAsk))
+                    mid = float(executor.get_price(conn, pair, PriceType.MidPrice))
+                except Exception:
+                    pass
+                price_move = ((close_px - entry) / entry) if entry else None
+                close_order = getattr(executor, "_close_order", None)
+                close_filled = bool(close_order and getattr(close_order, "is_done", False))
+                mid_move = ((mid - entry) / entry) if entry and mid else None
+                # Positive-PnL STOP_LOSS + mid still above SL = classic ghost-mark fill.
+                mid_above_sl = (
+                    mid_move is not None and mid_move > -sl
+                    if side_name in ("BUY", "TradeType.BUY")
+                    else (mid is not None and entry and ((entry - mid) / entry) > -sl)
+                )
+                _agent_debug_log(
+                    "executor_service.py:_handle_executor_completion",
+                    "STOP_LOSS completion snapshot",
+                    "A-false-sl-positive-pnl" if pnl_q > 0 else "A-barrier-close",
+                    {
+                        "executor_id": executor_id,
+                        "pair": executor.config.trading_pair,
+                        "side": side_name,
+                        "close_type": close_type_name,
+                        "entry_price": entry,
+                        "close_price": close_px,
+                        "close_order_filled": close_filled,
+                        "net_pnl_quote": pnl_q,
+                        "net_pnl_pct": pnl_pct,
+                        "stop_loss": sl,
+                        "take_profit": tp,
+                        "price_move_pct": price_move,
+                        "mid_move_vs_entry_pct": mid_move,
+                        "positive_pnl_stop_loss": pnl_q > 0,
+                        "mid_still_above_sl": mid_above_sl,
+                        "ghost_fill_suspect": bool(pnl_q > 0 and mid_above_sl),
+                        "best_bid_at_complete": bid,
+                        "best_ask_at_complete": ask,
+                        "mid_at_complete": mid,
+                        "retries": getattr(executor, "_current_retries", None),
+                    },
+                )
+        except Exception:
+            pass
+        # #endregion
+
         # Active executor already claimed via pop above; drop its metadata last
         # (metadata is read above and re-fetched inside the persist/aggregate
         # helpers, so it must stay until after those awaits complete).
@@ -2822,7 +3131,10 @@ class ExecutorService:
             result["connector_name"] = metadata.get("connector_name")
         if metadata.get("trading_pair"):
             result["trading_pair"] = metadata.get("trading_pair")
-        result["controller_id"] = metadata.get("controller_id", "main")
+        result["controller_id"] = self.effective_controller_id(
+            top_level=metadata.get("controller_id"),
+            config=metadata.get("config"),
+        )
 
         # Read status/close_type directly from executor
         result["status"] = executor.status.name
@@ -2865,6 +3177,7 @@ class ExecutorService:
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        config = json.loads(record.config) if record.config else None
         return {
             "executor_id": record.executor_id,
             "executor_type": record.executor_type,
@@ -2880,12 +3193,15 @@ class ExecutorService:
             "created_at": record.created_at.isoformat() if record.created_at else None,
             "close_timestamp": record.closed_at.timestamp() if record.closed_at else None,
             "closed_at": record.closed_at.isoformat() if record.closed_at else None,
-            "controller_id": record.controller_id or "main",
+            "controller_id": self.effective_controller_id(
+                top_level=record.controller_id,
+                config=config,
+            ),
             "net_pnl_quote": float(record.net_pnl_quote) if record.net_pnl_quote else 0.0,
             "net_pnl_pct": float(record.net_pnl_pct) if record.net_pnl_pct else 0.0,
             "cum_fees_quote": float(record.cum_fees_quote) if record.cum_fees_quote else 0.0,
             "filled_amount_quote": float(record.filled_amount_quote) if record.filled_amount_quote else 0.0,
-            "config": json.loads(record.config) if record.config else None,
+            "config": config,
             "custom_info": self._strip_heavy_fields(
                 json.loads(record.final_state), record.executor_type
             ) if record.final_state else None,
@@ -3000,7 +3316,11 @@ class ExecutorService:
         unrealized_pnl = 0.0
         for executor_id, executor in self._active_executors.items():
             metadata = self._executor_metadata.get(executor_id, {})
-            if controller_id and metadata.get("controller_id", "main") != controller_id:
+            effective_cid = self.effective_controller_id(
+                top_level=metadata.get("controller_id"),
+                config=metadata.get("config"),
+            )
+            if controller_id and effective_cid != controller_id:
                 continue
             try:
                 unrealized_pnl += float(executor.executor_info.net_pnl_quote)

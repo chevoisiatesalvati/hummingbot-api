@@ -296,9 +296,12 @@ class CreateExecutorRequest(BaseModel):
         None,
         description="Account name to use (defaults to master_account)"
     )
-    controller_id: str = Field(
-        default="main",
-        description="Controller ID that owns this executor (for per-agent isolation)"
+    controller_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Controller ID that owns this executor (for per-agent isolation). "
+            "When omitted, falls back to executor_config.controller_id, then 'main'."
+        ),
     )
     executor_config: Dict[str, Any] = Field(
         ...,
